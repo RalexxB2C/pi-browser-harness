@@ -99,15 +99,21 @@ Generated from `src/registry.ts` by `npm run gen:skill`; do not edit by hand.
 ## Connection Setup
 
 Browser control is **on-demand** — the daemon does NOT start automatically.
-If you try a browser tool and get a `not_connected` error, tell the user to
-run `/browser-setup` first. This opens the daemon and connects to Chrome.
-Once initialized, all subsequent sessions reuse the same connection silently.
+Nominally read-only tools (`browser_page_info`, `browser_list_tabs`, `browser_current_tab`,
+`browser_snapshot`, `browser_read_page`) can initialize the client and create a service window
+if the harness is not yet connected.
+
+If initialization or any prerequisite fails, the failure is latched; subsequent ordinary
+tools return that cause without repeating connection or seeding attempts. On the first
+prerequisite failure, stop and report rather than trying another read, setup, guessed profile,
+backend or model. Only explicitly requested setup (`browser_setup` or `/browser-setup`)
+permits a new initialization attempt.
 
 **Before calling any browser tool**, the runtime checks for the daemon socket
 at `/tmp/pi-browser-daemon.sock`. If the socket is missing (user hasn't run
 `/browser-setup`), you get: `"Browser harness not initialized. Run /browser-setup first"`.
 
-**Do not ask the user.** Call `browser_setup` directly — it spawns the daemon,
+**Explicit setup recovery:** Call `browser_setup` directly when explicit recovery is needed — it spawns the daemon,
 connects to Chrome, and opens a test tab. The user sees a single "Allow Remote
 Debugging" prompt the first time. After that, all sessions reuse the same connection.
 `browser_setup` is idempotent — safe to call even when already connected.
