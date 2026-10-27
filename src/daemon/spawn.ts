@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import { readLines } from "./lines";
-import { DAEMON_SOCKET_PATH, daemonSocketPath, deserialize, serialize, type WireControl } from "./protocol";
+import { daemonSocketPath, deserialize, serialize, type WireControl } from "./protocol";
 import { destroyQuietly } from "./socket";
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -19,7 +19,7 @@ const isWindows = process.platform === "win32";
 const cleanupStaleSocket = (): void => {
   if (isWindows) return;
   // ENOENT is the normal case; anything else surfaces when listen() fails.
-  unlink(DAEMON_SOCKET_PATH).catch(() => undefined);
+  unlink(daemonSocketPath()).catch(() => undefined);
 };
 
 export const daemonSocketMayExist = async (
@@ -46,7 +46,7 @@ export const isDaemonRunning = async (timeoutMs = 2_000): Promise<boolean> => {
       resolve(alive);
     };
 
-    const sock = createConnection(DAEMON_SOCKET_PATH);
+    const sock = createConnection(daemonSocketPath());
     const timer = setTimeout(() => {
       destroyQuietly(sock);
       cleanupStaleSocket();

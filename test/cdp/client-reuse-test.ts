@@ -79,6 +79,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        namespace: "test-reuse-default",
         browserId: "b1",
         userDataDir: defaultPin.userDataDir,
         profilePin: defaultPin,
@@ -122,6 +123,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
       profilePin: workPin,
       initialOwnership: {
+        namespace: "test-reuse-named",
         browserId: "b1",
         userDataDir: workPin.userDataDir,
         profilePin: workPin,
@@ -174,7 +176,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       transport: stub.transport,
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
-      initialOwnership: { ownedTargetIds: [] },
+      initialOwnership: { namespace: "test-no-ownership", ownedTargetIds: [] },
       seedDeps,
     });
 
@@ -219,6 +221,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        namespace: "test-stale-target",
         browserId: "b1",
         userDataDir: defaultPin.userDataDir,
         profilePin: defaultPin,
@@ -272,6 +275,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-b", browserId: "browser-a", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        namespace: "test-browser-change",
         browserId: "browser-a",
         userDataDir: defaultPin.userDataDir,
         profilePin: defaultPin,
@@ -314,6 +318,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        namespace: "test-ambiguous-reuse",
         browserId: "b1",
         userDataDir: defaultPin.userDataDir,
         profilePin: defaultPin,
@@ -375,7 +380,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       // Fresh client with no prior ownership
-      initialOwnership: { ownedTargetIds: [] },
+      initialOwnership: { namespace: "test-context-absence", ownedTargetIds: [] },
       seedDeps,
     });
 
@@ -406,6 +411,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
       profilePin: workPin,
       initialOwnership: {
+        namespace: "test-pin-change",
         browserId: "b1",
         userDataDir: workPin.userDataDir,
         profilePin: workPin,
@@ -467,6 +473,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        namespace: "test-pin-mismatch",
         browserId: "b1",
         userDataDir: workPin.userDataDir,
         profilePin: workPin,
@@ -525,6 +532,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
       profilePin: workPin,
       initialOwnership: {
+        namespace: "test-unpinned-to-pinned",
         browserId: "b1",
         userDataDir: workPin.userDataDir,
         ownedTargetIds: ["unpinned-tab"],
@@ -602,6 +610,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
       profilePin: workPin,
       initialOwnership: {
+        namespace: "test-pin-change-read",
         browserId: "b1",
         userDataDir: workPin.userDataDir,
         profilePin: workPin,

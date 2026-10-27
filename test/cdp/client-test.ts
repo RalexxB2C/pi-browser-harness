@@ -30,7 +30,7 @@ const started = async (canned: Canned = {}) => {
     namespace: "test",
     transport: stub.transport,
     remote: { cdpUrl: "ws://127.0.0.1:1/devtools/browser/abc", browserId: "abc" },
-    initialOwnership: { ownedTargetIds: ["t1"] },
+    initialOwnership: { namespace: "test", browserId: "abc", ownedTargetIds: ["t1"] },
   });
   const r = await client.start();
   assert.equal(r.success, true);

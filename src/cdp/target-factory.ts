@@ -106,13 +106,20 @@ export const ensureHarnessWindow = async (client: BrowserClient): Promise<Result
 const ensureHarnessWindowUncoordinated = async (
   client: BrowserClient,
 ): Promise<Result<HarnessWindow, CdpError>> => {
+  const pin = client.profilePin();
+  if (pin) {
+    const idVerified = await client.verifyProfileIdentity();
+    if (!idVerified.success) {
+      return idVerified;
+    }
+  }
+
   const targets = await listPageTargets(client);
   if (!targets.success) return targets;
   const live = new Set(targets.data.map((t) => t.targetId));
 
   const ownership = client.ownership();
   reconcileOwnership(ownership, live);
-  const pin = client.profilePin();
 
   if (!pin) {
     const harnessWindow = ownership.harnessWindow();
@@ -127,11 +134,6 @@ const ensureHarnessWindowUncoordinated = async (
     const seeded = await createDedicatedWindow(client);
     if (!seeded.success) return seeded;
     return ok({ targetId: seeded.data, freshlyCreated: true });
-  }
-
-  const idVerified = await client.verifyProfileIdentity();
-  if (!idVerified.success) {
-    return idVerified;
   }
 
   const harnessWindow = ownership.harnessWindow();

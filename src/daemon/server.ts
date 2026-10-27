@@ -7,7 +7,7 @@ import {
   type WireControl,
   deserialize,
   serialize,
-  DAEMON_SOCKET_PATH,
+  daemonSocketPath,
   DAEMON_MAX_CLIENTS,
 } from "./protocol";
 
@@ -27,6 +27,7 @@ export type Disposer = () => void;
 export type IpcServerOptions = {
   readonly socketPath?: string;
   readonly maxClients?: number;
+  readonly provenance?: () => { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
 };
 
 export type IpcServer = {
@@ -51,7 +52,7 @@ const listen = <H>(handlers: Set<H>) => (handler: H): Disposer => {
 
 
 export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
-  const socketPath = options.socketPath ?? DAEMON_SOCKET_PATH;
+  const socketPath = options.socketPath ?? daemonSocketPath();
   const maxClients = options.maxClients ?? DAEMON_MAX_CLIENTS;
   let server: Server | null = null;
   // Sockets that have not registered yet, by their temporary id.
@@ -120,7 +121,15 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
             client.registered = true;
             clients.set(clientId, client);
 
-            const ack: WireControl = { type: "control", action: "registered", clientId };
+            const prov = options.provenance?.();
+            const ack: WireControl = {
+              type: "control",
+              action: "registered",
+              clientId,
+              ...(prov?.browserId !== undefined ? { browserId: prov.browserId } : {}),
+              ...(prov?.userDataDir !== undefined ? { userDataDir: prov.userDataDir } : {}),
+              ...(prov?.cdpUrl !== undefined ? { cdpUrl: prov.cdpUrl } : {}),
+            };
             socket.write(serialize(ack) + "\n");
 
             for (const h of connectHandlers) h(client);

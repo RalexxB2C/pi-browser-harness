@@ -33,7 +33,14 @@ export type ControlAction = (typeof CONTROL_ACTIONS)[number];
 // Each action carries exactly the fields it needs, so a handler that has matched on `action`
 // never has to re-check what the guard already proved.
 export type WireRegister = { readonly type: "control"; readonly action: "register"; readonly clientId: string };
-export type WireRegistered = { readonly type: "control"; readonly action: "registered"; readonly clientId: string };
+export type WireRegistered = {
+  readonly type: "control";
+  readonly action: "registered";
+  readonly clientId: string;
+  readonly browserId?: string;
+  readonly userDataDir?: string;
+  readonly cdpUrl?: string;
+};
 export type WireDeregister = { readonly type: "control"; readonly action: "deregister"; readonly clientId: string };
 export type WireShutdown = { readonly type: "control"; readonly action: "shutdown"; readonly reason?: string };
 
@@ -53,9 +60,15 @@ const isWireControl = (v: Record<string, unknown>): v is WireControl => {
   if (!isControlAction(action)) return false;
   switch (action) {
     case "register":
-    case "registered":
     case "deregister":
       return typeof v["clientId"] === "string";
+    case "registered":
+      return (
+        typeof v["clientId"] === "string" &&
+        isOptionalString(v["browserId"]) &&
+        isOptionalString(v["userDataDir"]) &&
+        isOptionalString(v["cdpUrl"])
+      );
     case "shutdown":
       return isOptionalString(v["reason"]);
   }

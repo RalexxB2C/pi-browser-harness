@@ -1,5 +1,7 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { createServer, type Server, type Socket } from "node:net";
+import { createInterface } from "node:readline";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -15,6 +17,8 @@ import { fakeCtx, fakePi } from "../helpers/fake-pi";
 import type { ProfileWindowRequest } from "../../src/profile/launch";
 import type { SeedDeps } from "../../src/profile/bind";
 import { ok } from "../../src/util/result";
+import { createDaemonTransport } from "../../src/daemon/transport";
+import { deserialize, serialize, type WireControl, type WireRequest } from "../../src/daemon/protocol";
 
 // test/domains/extension-registration-test.ts covers the third-party tool seam and that contributed
 // tools reach pi on session_start. This file covers the extension's own wiring: flags, commands,
@@ -30,6 +34,46 @@ const load = () => {
   browserHarnessExtension(pi.pi);
   return pi;
 };
+
+const SKIP_SOCKET = process.platform === "win32" ? "daemon uses named pipe on win32" : false;
+
+const createIsolatedDaemon = (
+  onRegister: (conn: Socket, clientId: string) => void,
+  onRequest: (conn: Socket, msg: WireRequest) => void = (conn, msg) => {
+    conn.write(serialize({ type: "response", id: msg.id, result: {} }) + "\n");
+  },
+): Promise<{ readonly socketPath: string; readonly dispose: () => Promise<void> }> =>
+  new Promise((resolve) => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-ext-daemon-"));
+    const socketPath = join(dir, "d.sock");
+    const connections: Socket[] = [];
+    const server: Server = createServer((conn) => {
+      connections.push(conn);
+      conn.on("error", () => undefined);
+      const rl = createInterface({ input: conn, crlfDelay: Infinity });
+      rl.on("line", (line) => {
+        const msg = deserialize(line);
+        if (msg?.type === "control" && msg.action === "register") {
+          onRegister(conn, msg.clientId);
+        } else if (msg?.type === "request") {
+          onRequest(conn, msg);
+        }
+      });
+    });
+    server.listen(socketPath, () => {
+      resolve({
+        socketPath,
+        dispose: () =>
+          new Promise((done) => {
+            for (const c of connections) c.destroy();
+            server.close(() => {
+              rmSync(dir, { recursive: true, force: true });
+              done();
+            });
+          }),
+      });
+    });
+  });
 
 describe("browser harness extension", () => {
   let agentDir: string;
@@ -271,47 +315,52 @@ describe("createExtension wiring", () => {
     assert.match(ctx.notices[0]?.message ?? "", /Browser: .*Connected/);
   });
 
-  test("fresh reuse works through real createExtension entry point: eligible restored ownership reuses window with zero launches", async () => {
-    const savedCdpWs = process.env["BU_CDP_WS"];
-    process.env["BU_CDP_WS"] = "ws://127.0.0.1:9222/devtools/browser/b-entry";
-
+  test("real createDaemonTransport in createExtension: successful valid provenance reuses window with zero launches", { skip: SKIP_SOCKET }, async () => {
     const extPin: ProfilePin = { userDataDir: PIN.userDataDir, profileDir: "Default", label: "Alice", savedAt: "" };
+    const PAGE_JSON = JSON.stringify({
+      url: "https://example.test/",
+      title: "Reused Page",
+      w: 800,
+      h: 600,
+      sx: 0,
+      sy: 0,
+      pw: 800,
+      ph: 600,
+    });
+
+    const daemon = await createIsolatedDaemon(
+      (conn, clientId) => {
+        const ack: WireControl = {
+          type: "control",
+          action: "registered",
+          clientId,
+          browserId: "b-daemon-entry",
+          userDataDir: PIN.userDataDir,
+          cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-entry",
+        };
+        conn.write(serialize(ack) + "\n");
+      },
+      (conn, req) => {
+        if (req.method === "Target.getTargets") {
+          conn.write(serialize({
+            type: "response",
+            id: req.id,
+            result: { targetInfos: [{ targetId: "tab-reused", type: "page", title: "Reused Page", url: "https://example.test/" }] },
+          }) + "\n");
+        } else if (req.method === "Target.attachToTarget") {
+          conn.write(serialize({ type: "response", id: req.id, result: { sessionId: "s-reused" } }) + "\n");
+        } else if (req.method === "Browser.getWindowForTarget") {
+          conn.write(serialize({ type: "response", id: req.id, result: { windowId: 55 } }) + "\n");
+        } else if (req.method === "Runtime.evaluate") {
+          conn.write(serialize({ type: "response", id: req.id, result: { result: { type: "string", value: PAGE_JSON } } }) + "\n");
+        } else {
+          conn.write(serialize({ type: "response", id: req.id, result: {} }) + "\n");
+        }
+      },
+    );
 
     try {
       const launches: ProfileWindowRequest[] = [];
-      const PAGE_JSON = JSON.stringify({
-        url: "https://example.test/",
-        title: "Reused Page",
-        w: 800,
-        h: 600,
-        sx: 0,
-        sy: 0,
-        pw: 800,
-        ph: 600,
-      });
-      const stub = createStubTransport({
-        "Target.setDiscoverTargets": ok({}),
-        "Target.getTargets": ok({
-          targetInfos: [
-            { targetId: "tab-reused", type: "page", title: "Reused Page", url: "https://example.test/" },
-          ],
-        }),
-        "Target.attachToTarget": [ok({ sessionId: "s-reused" })],
-        "Browser.getWindowForTarget": ok({ windowId: 55 }),
-        "Target.activateTarget": ok({}),
-        "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-      });
-
-      const transport = {
-        ...stub.transport,
-        connect: () => Promise.resolve(ok(undefined)),
-        actualEndpoint: () => ({
-          wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-entry",
-          browserId: "b-entry",
-          userDataDir: PIN.userDataDir,
-        }),
-      };
-
       const seedDeps: SeedDeps = {
         detectRunningBrowser: () => Promise.resolve({
           running: true,
@@ -332,7 +381,7 @@ describe("createExtension wiring", () => {
       };
 
       const extension = createExtension({
-        createTransport: () => transport,
+        createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
         readPin: () => Promise.resolve(extPin),
         seedDeps,
       });
@@ -348,7 +397,7 @@ describe("createExtension wiring", () => {
             customType: "browser-harness-state",
             data: {
               namespace: "fresh-session",
-              browserId: "b-entry",
+              browserId: "b-daemon-entry",
               userDataDir: PIN.userDataDir,
               profilePin: extPin,
               ownedTargetIds: ["tab-reused"],
@@ -369,8 +418,105 @@ describe("createExtension wiring", () => {
       assert.match(ctx.notices.find((n) => n.message.includes("Browser:"))?.message ?? "", /Browser: .*Connected/);
       assert.match(ctx.notices.find((n) => n.message.includes("Reused Page"))?.message ?? "", /Reused Page/);
     } finally {
-      if (savedCdpWs === undefined) Reflect.deleteProperty(process.env, "BU_CDP_WS");
-      else process.env["BU_CDP_WS"] = savedCdpWs;
+      await daemon.dispose();
+    }
+  });
+
+  test("real createDaemonTransport in createExtension: missing/legacy handshake provenance fails closed before spawn", { skip: SKIP_SOCKET }, async () => {
+    const extPin: ProfilePin = { userDataDir: PIN.userDataDir, profileDir: "Default", label: "Alice", savedAt: "" };
+    const daemon = await createIsolatedDaemon((conn, clientId) => {
+      const ack: WireControl = { type: "control", action: "registered", clientId };
+      conn.write(serialize(ack) + "\n");
+    });
+
+    try {
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: PIN.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+        },
+      };
+
+      const extension = createExtension({
+        createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
+        readPin: () => Promise.resolve(extPin),
+        seedDeps,
+      });
+
+      const pi = fakePi();
+      pi.setFlag("browser-namespace", "fresh-session");
+      extension(pi.pi);
+
+      const ctx = fakeCtx();
+      await pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+
+      await pi.command("browser-reload-daemon").handler("", ctx.ctx);
+
+      assert.equal(launches.length, 0, "must fail closed before spawn when daemon sends no provenance");
+      assert.match(ctx.notices.find((n) => n.message.includes("Restart failed:"))?.message ?? "", /no verified user-data-dir endpoint linkage/i);
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("real createDaemonTransport in createExtension: daemon connected to B while discovery found A fails closed before spawn", { skip: SKIP_SOCKET }, async () => {
+    const extPin: ProfilePin = { userDataDir: "/home/u/.config/browser-A", profileDir: "Default", label: "Profile A", savedAt: "" };
+    const daemon = await createIsolatedDaemon((conn, clientId) => {
+      const ack: WireControl = {
+        type: "control",
+        action: "registered",
+        clientId,
+        browserId: "browser-B",
+        userDataDir: "/home/u/.config/browser-B",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
+      };
+      conn.write(serialize(ack) + "\n");
+    });
+
+    try {
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: extPin.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+        },
+      };
+
+      const extension = createExtension({
+        createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
+        readPin: () => Promise.resolve(extPin),
+        seedDeps,
+      });
+
+      const pi = fakePi();
+      pi.setFlag("browser-namespace", "fresh-session");
+      extension(pi.pi);
+
+      const ctx = fakeCtx();
+      await pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+
+      await pi.command("browser-reload-daemon").handler("", ctx.ctx);
+
+      assert.equal(launches.length, 0, "must fail closed before spawn on mismatch between transport and pin");
+      assert.match(
+        ctx.notices.find((n) => n.message.includes("Restart failed:"))?.message ?? "",
+        /belongs to \/home\/u\/\.config\/browser-A, but the harness is connected to \/home\/u\/\.config\/browser-B/,
+      );
+    } finally {
+      await daemon.dispose();
     }
   });
 

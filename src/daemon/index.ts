@@ -28,8 +28,10 @@ export const describeError = (e: unknown): string => (e instanceof Error ? (e.st
 // idle timer and shutdown. Every collaborator is injectable so the wiring can be driven in-process.
 // The process entry that starts it lives in ./main.ts, so importing this module never launches a daemon.
 export const createDaemon = (deps: DaemonDeps = {}): Daemon => {
-  const ipcServer = deps.ipcServer ?? createIpcServer();
   const cdpBridge = deps.cdpBridge ?? createCdpBridge();
+  const ipcServer = deps.ipcServer ?? createIpcServer({
+    provenance: () => cdpBridge.provenance(),
+  });
   const idleTimeoutMs = deps.idleTimeoutMs ?? DAEMON_IDLE_TIMEOUT_MS;
   const exit = deps.exit ?? ((code: number): void => { process.exit(code); });
   const log = deps.log ?? ((line: string): void => { console.log(`${LOG_PREFIX} ${line}`); });

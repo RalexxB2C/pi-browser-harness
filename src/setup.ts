@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { BrowserClient } from "./client";
 import { ensureDaemon } from "./daemon/spawn";
-import { DAEMON_SOCKET_PATH } from "./daemon/protocol";
+import { daemonSocketPath } from "./daemon/protocol";
 import { isBrowserRunning } from "./profile/browser-process";
 import { promptForProfileIfUnset } from "./profile/command";
 import { type Result, err, ok } from "./util/result";
@@ -40,7 +40,7 @@ export async function performSetup(
 
   const daemonReady = await (deps.ensureDaemon ?? ensureDaemon)();
   if (!daemonReady) {
-    return err(`Could not start the browser daemon. Check ${DAEMON_SOCKET_PATH}.`);
+    return err(`Could not start the browser daemon. Check ${daemonSocketPath()}.`);
   }
 
   const profileNote = await promptForProfileIfUnset(client, ctx);

@@ -202,7 +202,6 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
         return discovered;
       }
       wsUrl = discovered.data.wsUrl;
-      transportUserDataDir = discovered.data.userDataDir;
     }
     const connected = await transport.connect(wsUrl, { timeoutMs: 10_000 });
     if (!connected.success) {
@@ -228,7 +227,10 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       transportUserDataDir = actual.userDataDir;
     }
 
-    const newBrowserId: string = actual?.browserId ?? wsUrl.split("/").pop() ?? "unknown";
+    const newBrowserId: string =
+      actual?.browserId ??
+      (actual?.wsUrl ? actual.wsUrl.split("/").pop() ?? "unknown" : undefined) ??
+      (wsUrl.split("/").pop() ?? "unknown");
     userDataDir = transportUserDataDir;
 
     const expectedBrowserId = remote?.browserId ?? opts.initialOwnership?.browserId;
@@ -240,18 +242,28 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       if (!a || !b) return false;
       return a.userDataDir === b.userDataDir && a.profileDir === b.profileDir;
     };
-    const browserMatches = expectedBrowserId === newBrowserId;
-    const pinMatches = profilePin !== null
-      ? (opts.initialOwnership?.profilePin !== undefined && samePin(opts.initialOwnership.profilePin, profilePin))
-      : opts.initialOwnership?.profilePin === undefined;
-    const namespaceMatches = !opts.initialOwnership?.namespace || opts.initialOwnership.namespace === opts.namespace;
+    const browserMatches = Boolean(
+      opts.initialOwnership &&
+      expectedBrowserId &&
+      expectedBrowserId === newBrowserId &&
+      newBrowserId !== "unknown",
+    );
+    const pinMatches = Boolean(
+      opts.initialOwnership &&
+      (profilePin !== null
+        ? opts.initialOwnership.profilePin !== undefined && samePin(opts.initialOwnership.profilePin, profilePin)
+        : opts.initialOwnership.profilePin === undefined),
+    );
+    const namespaceMatches = opts.initialOwnership?.namespace === opts.namespace;
 
-    if (!browserMatches || !pinMatches || !namespaceMatches) {
-      profileContext = { kind: "unresolved" };
-      profileContextId = undefined;
-      ownership.replaceAll([]);
-      ownership.setHarnessWindow(undefined);
-      ownership.setHarnessWindowId(undefined);
+    if (opts.initialOwnership) {
+      if (!browserMatches || !pinMatches || !namespaceMatches) {
+        profileContext = { kind: "unresolved" };
+        profileContextId = undefined;
+        ownership.replaceAll([]);
+        ownership.setHarnessWindow(undefined);
+        ownership.setHarnessWindowId(undefined);
+      }
     }
     remote = { cdpUrl: wsUrl, browserId: newBrowserId, ...(userDataDir ? { userDataDir } : {}) };
     const seeded = await seedIfPinned();

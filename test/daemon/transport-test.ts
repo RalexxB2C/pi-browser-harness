@@ -8,6 +8,11 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createDaemonTransport } from "../../src/daemon/transport";
 import { deserialize, serialize, type WireControl } from "../../src/daemon/protocol";
+import { createBrowserClient } from "../../src/client";
+import type { ProfilePin } from "../../src/profile/store";
+import type { SeedDeps } from "../../src/profile/bind";
+import type { ProfileWindowRequest } from "../../src/profile/launch";
+import { ok } from "../../src/util/result";
 
 const SKIP = process.platform === "win32" ? "the fake daemon listens on a temp socket file" : false;
 
@@ -145,6 +150,88 @@ describe("daemon transport", { skip: SKIP }, () => {
       await sleep(20);
       assert.equal(closes, 1);
       assert.equal(transport.state(), "closed");
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("handshake provenance: returns actual connected browser provenance when daemon provides it", async () => {
+    const daemon = await startFakeDaemon((conn, clientId) => {
+      const ack: WireControl = {
+        type: "control",
+        action: "registered",
+        clientId,
+        browserId: "b-daemon-1",
+        userDataDir: "/home/u/.config/daemon-chrome",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-1",
+      };
+      conn.write(serialize(ack) + "\n");
+    });
+    try {
+      const transport = createDaemonTransport("client-prov", daemon.socketPath);
+      const r = await transport.connect("");
+      assert.equal(r.success, true);
+      assert.deepEqual(transport.actualEndpoint?.(), {
+        browserId: "b-daemon-1",
+        userDataDir: "/home/u/.config/daemon-chrome",
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-1",
+      });
+      await transport.close();
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("legacy handshake provenance: actualEndpoint returns undefined when daemon sends no provenance and client fails closed", async () => {
+    // Daemon sends legacy registered ack with NO browserId or userDataDir
+    const daemon = await startFakeDaemon((conn, clientId) => {
+      const ack: WireControl = {
+        type: "control",
+        action: "registered",
+        clientId,
+      };
+      conn.write(serialize(ack) + "\n");
+    });
+    try {
+      const transport = createDaemonTransport("client-legacy", daemon.socketPath);
+      const r = await transport.connect("");
+      assert.equal(r.success, true);
+      assert.equal(transport.actualEndpoint?.(), undefined);
+
+      const pin: ProfilePin = {
+        userDataDir: "/home/u/.config/google-chrome",
+        profileDir: "Profile 1",
+        label: "Work",
+        savedAt: "",
+      };
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: pin.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+        },
+      };
+
+      const client = createBrowserClient({
+        namespace: "test-legacy-daemon",
+        transport,
+        profilePin: pin,
+        seedDeps,
+      });
+
+      const startRes = await client.start();
+      assert.equal(startRes.success, false);
+      assert.equal(startRes.error.kind, "discovery_failed");
+      assert.match(startRes.error.message, /no verified user-data-dir endpoint linkage/i);
+      assert.equal(launches.length, 0, "legacy daemon with unknown provenance must fail closed before spawn");
+
+      await transport.close();
     } finally {
       await daemon.dispose();
     }

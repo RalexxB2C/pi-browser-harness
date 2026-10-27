@@ -41,6 +41,7 @@ export type CdpBridge = {
   readonly onEvent: (handler: EventHandler) => void;
   // Fires when an established Chrome connection drops; never for an attempt that failed to open.
   readonly onClose: (handler: CloseHandler) => void;
+  readonly provenance: () => { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
 };
 
 export type InFlight = {
@@ -288,5 +289,6 @@ export const createCdpBridge = (options: ChromeConnectionDependencies = {}): Cdp
     },
     onEvent: (h) => { eventHandler = h; },
     onClose: (h) => { closeHandler = h; },
+    provenance: () => connection.provenance(),
   };
 };
