@@ -9,9 +9,11 @@ import {
   parseUserDataDirFlag,
   rankBrowserCandidate,
   resolveBrowserExecutable,
+  selectBrowserCandidate,
   spawnableExePath,
   stripDeletedSuffix,
   userDataDirFromArgv,
+  type BrowserCandidate,
 } from "../../src/profile/browser-process";
 
 describe("browser-process parsing and candidate ranking", () => {
@@ -70,6 +72,95 @@ describe("browser-process parsing and candidate ranking", () => {
   test("B9: an absent or empty --user-data-dir reads as undefined", () => {
     assert.equal(userDataDirFromArgv(["/usr/bin/chrome"]), undefined);
     assert.equal(userDataDirFromArgv(["/usr/bin/chrome", "--user-data-dir="]), undefined);
+  });
+
+  test("B9: recognizes an explicit user-data-dir in a rewritten process-title command line", () => {
+    const raw = "/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=/home/u/.config/google-chrome\0";
+    const argv = parseProcCmdline(raw);
+    assert.equal(userDataDirFromArgv(argv), "/home/u/.config/google-chrome");
+  });
+
+  describe("selectBrowserCandidate identity verification", () => {
+    const targetDir = "/home/u/.config/google-chrome";
+    const chromeExe = "/opt/google/chrome/chrome";
+    const cftExe = "/home/u/.agent-browser/browsers/chrome-150.0.7871.115/chrome";
+
+    test("ambiguous zero-spawn: [Chrome, CFT] candidate order with absent flags", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: chromeExe },
+        { exePath: cftExe },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, true);
+      assert.equal(result.exePath, undefined);
+      assert.match(result.error ?? "", /ambiguous/i);
+    });
+
+    test("ambiguous zero-spawn: [CFT, Chrome] candidate order with absent flags", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: cftExe },
+        { exePath: chromeExe },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, true);
+      assert.equal(result.exePath, undefined);
+      assert.match(result.error ?? "", /ambiguous/i);
+    });
+
+    test("verified positive identity: ordinary explicit flag on Chrome outranks absent CFT in both orders", () => {
+      const chromeExplicit: BrowserCandidate = { exePath: chromeExe, explicitUserDataDir: targetDir };
+      const cftAbsent: BrowserCandidate = { exePath: cftExe };
+
+      const order1 = selectBrowserCandidate([chromeExplicit, cftAbsent], targetDir);
+      assert.equal(order1.running, true);
+      assert.equal(order1.ambiguous, undefined);
+      assert.equal(order1.exePath, chromeExe);
+      assert.equal(order1.explicitUserDataDir, targetDir);
+
+      const order2 = selectBrowserCandidate([cftAbsent, chromeExplicit], targetDir);
+      assert.equal(order2.running, true);
+      assert.equal(order2.ambiguous, undefined);
+      assert.equal(order2.exePath, chromeExe);
+      assert.equal(order2.explicitUserDataDir, targetDir);
+    });
+
+    test("verified positive identity: rewritten explicit flag parsed from argv", () => {
+      const argv = parseProcCmdline(`${chromeExe} --user-data-dir=${targetDir}\0`);
+      const explicit = userDataDirFromArgv(argv);
+      assert.equal(explicit, targetDir);
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: cftExe },
+        { exePath: chromeExe, explicitUserDataDir: explicit },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, undefined);
+      assert.equal(result.exePath, chromeExe);
+      assert.equal(result.explicitUserDataDir, targetDir);
+    });
+
+    test("mismatches: candidate with different explicit user-data-dir is rejected", () => {
+      const otherDir = "/home/u/.config/BraveSoftware/Brave-Browser";
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: "/usr/bin/brave-browser", explicitUserDataDir: otherDir },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, false);
+      assert.equal(result.exePath, undefined);
+    });
+
+    test("verified positive identity: single candidate uniquely matching target without rivals", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: chromeExe, explicitUserDataDir: targetDir },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, undefined);
+      assert.equal(result.exePath, chromeExe);
+      assert.equal(result.explicitUserDataDir, targetDir);
+    });
   });
 
   test("B2: exact user-data-dir match outranks a flagless process", () => {

@@ -62,6 +62,26 @@ export const seedProfileWindow = async (
 
   const targetUserDataDir = connectedDir ?? pin.userDataDir;
   const running = await detect(targetUserDataDir);
+  if (running.ambiguous) {
+    return err(cdpError(
+      "discovery_failed",
+      `could not verify browser identity for "${pin.label}": ${running.error ?? "ambiguous browser candidates"} — ${manualFallbackHint(pin)}`,
+    ));
+  }
+  if (!running.running) {
+    return err(cdpError(
+      "discovery_failed",
+      running.error
+        ? `${running.error} — ${manualFallbackHint(pin)}`
+        : `could not locate the browser executable needed to open "${pin.label}" — ${manualFallbackHint(pin)}`,
+    ));
+  }
+  if (running.explicitUserDataDir && running.explicitUserDataDir !== targetUserDataDir) {
+    return err(cdpError(
+      "discovery_failed",
+      `running browser's user-data-dir (${running.explicitUserDataDir}) does not match the pinned profile (${targetUserDataDir}) — ${manualFallbackHint(pin)}`,
+    ));
+  }
   const exePath = await resolveExe(running);
   if (!exePath) {
     return err(cdpError(

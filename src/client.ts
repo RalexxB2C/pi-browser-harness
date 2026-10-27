@@ -11,7 +11,7 @@ import type { CdpTransport } from "./cdp/types";
 import { type CdpSession, createCdpSession } from "./cdp/session";
 import { type OwnershipRegistry, createOwnershipRegistry, reconcileOwnership } from "./cdp/ownership";
 import { ensureHarnessWindow, openHarnessTab } from "./cdp/target-factory";
-import { seedProfileWindow } from "./profile/bind";
+import { seedProfileWindow, type SeedDeps } from "./profile/bind";
 import type { ProfilePin } from "./profile/store";
 import type { DaemonStatus, DialogInfo, PageInfo, PageInfoResult, TabInfo } from "./cdp/types";
 
@@ -30,6 +30,7 @@ export type BrowserClientOptions = {
     readonly harnessWindowTargetId: string | undefined;
     readonly harnessWindowId: number | undefined;
   }) => void;
+  readonly seedDeps?: SeedDeps;
 };
 
 export type BrowserClient = {
@@ -391,7 +392,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       if (!profilePin) {
         return err(cdpError("discovery_failed", "no browser profile is selected — run /browser-profile"));
       }
-      return seedProfileWindow(api, profilePin);
+      return seedProfileWindow(api, profilePin, opts.seedDeps);
     },
     mutationMutex: () => mutationMutex,
   };

@@ -17,6 +17,8 @@ export type RunningBrowser = {
   readonly running: boolean;
   readonly exePath?: string;
   readonly explicitUserDataDir?: string;
+  readonly ambiguous?: boolean;
+  readonly error?: string;
 };
 
 const LINUX_COMMS: ReadonlyArray<string> = [
@@ -46,7 +48,8 @@ const USER_DATA_DIR_FLAG = "--user-data-dir=";
 export const userDataDirFromArgv = (argv: ReadonlyArray<string>): string | undefined => {
   const flag = argv.find((arg) => arg.startsWith(USER_DATA_DIR_FLAG));
   const value = flag?.slice(USER_DATA_DIR_FLAG.length);
-  return value !== undefined && value.length > 0 ? value : undefined;
+  // Chrome can rewrite all arguments into a single NUL-terminated process title.
+  return value !== undefined && value.length > 0 ? value : parseUserDataDirFlag(argv[0] ?? "");
 };
 const MAC_BROWSER_NAMES: ReadonlyArray<string> = [
   "google chrome", "chromium", "microsoft edge", "brave browser",
@@ -308,6 +311,65 @@ const winRegistryExecutable = async (): Promise<string | undefined> => {
   return undefined;
 };
 
+export const selectBrowserCandidate = (
+  candidates: ReadonlyArray<BrowserCandidate>,
+  preferUserDataDir?: string,
+): RunningBrowser => {
+  if (candidates.length === 0) return { running: false };
+
+  if (!preferUserDataDir) {
+    const first = candidates[0];
+    return {
+      running: true,
+      ...(first?.exePath ? { exePath: first.exePath } : {}),
+      ...(first?.explicitUserDataDir ? { explicitUserDataDir: first.explicitUserDataDir } : {}),
+    };
+  }
+
+  const exactMatches = candidates.filter((c) => rankBrowserCandidate(c, preferUserDataDir) === 4);
+  if (exactMatches.length > 0) {
+    const distinctExes = Array.from(new Set(exactMatches.map((c) => c.exePath).filter((p): p is string => Boolean(p))));
+    if (distinctExes.length === 1) {
+      const matchExe = distinctExes[0];
+      const matchDir = exactMatches[0]?.explicitUserDataDir;
+      return {
+        running: true,
+        ...(matchExe ? { exePath: matchExe } : {}),
+        ...(matchDir ? { explicitUserDataDir: matchDir } : {}),
+      };
+    }
+    return {
+      running: true,
+      ambiguous: true,
+      error: `multiple distinct browser executables (${distinctExes.join(", ")}) claim ${preferUserDataDir}`,
+    };
+  }
+
+  const familyMatches = candidates.filter((c) => rankBrowserCandidate(c, preferUserDataDir) === 3);
+  if (familyMatches.length > 0) {
+    const distinctExes = Array.from(new Set(familyMatches.map((c) => c.exePath).filter((p): p is string => Boolean(p))));
+    if (distinctExes.length > 1) {
+      return {
+        running: true,
+        ambiguous: true,
+        error: `ambiguous browser identity: multiple candidates (${distinctExes.join(", ")}) found without an explicit user-data-dir flag for ${preferUserDataDir}`,
+      };
+    }
+    if (distinctExes.length === 1) {
+      const matchExe = distinctExes[0];
+      return {
+        running: true,
+        ...(matchExe ? { exePath: matchExe } : {}),
+      };
+    }
+  }
+
+  return {
+    running: false,
+    error: `no running browser candidate matches ${preferUserDataDir}`,
+  };
+};
+
 export const detectRunningBrowser = async (preferUserDataDir?: string): Promise<RunningBrowser> => {
   const candidates =
     process.platform === "darwin"
@@ -315,31 +377,14 @@ export const detectRunningBrowser = async (preferUserDataDir?: string): Promise<
       : process.platform === "win32"
         ? await collectWin32()
         : await collectLinux();
-  if (candidates.length === 0) return { running: false };
-
-  const [first, ...rest] = candidates;
-  if (!first) return { running: false };
-  let best = first;
-  let bestRank = rankBrowserCandidate(best, preferUserDataDir);
-  for (const candidate of rest) {
-    const rank = rankBrowserCandidate(candidate, preferUserDataDir);
-    if (rank > bestRank) {
-      best = candidate;
-      bestRank = rank;
-    }
-  }
-
-  return {
-    running: true,
-    ...(best.exePath ? { exePath: best.exePath } : {}),
-    ...(best.explicitUserDataDir ? { explicitUserDataDir: best.explicitUserDataDir } : {}),
-  };
+  return selectBrowserCandidate(candidates, preferUserDataDir);
 };
 
 export const isBrowserRunning = async (): Promise<boolean> => (await detectRunningBrowser()).running;
 
 export const resolveBrowserExecutable = async (running?: RunningBrowser): Promise<string | undefined> => {
   const detected = running ?? (await detectRunningBrowser());
+  if (detected.ambiguous) return undefined;
   const usable = detected.exePath ? await spawnableExePath(detected.exePath) : undefined;
   if (usable) return usable;
   if (process.platform !== "win32") return undefined;

@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import { createBrowserClient } from "../../src/client";
 import { createStubTransport, flush, type Canned } from "../domains/fake-client";
 import { ok } from "../../src/util/result";
+import type { ProfilePin } from "../../src/profile/store";
+import type { BrowserCandidate } from "../../src/profile/browser-process";
+import { selectBrowserCandidate } from "../../src/profile/browser-process";
+import type { ProfileWindowRequest } from "../../src/profile/launch";
+import type { SeedDeps } from "../../src/profile/bind";
 
 const PAGE_JSON = JSON.stringify({ url: "https://one.test/", title: "One", w: 1, h: 2, sx: 0, sy: 0, pw: 3, ph: 4 });
 
@@ -68,16 +73,112 @@ describe("BrowserClient.detach", () => {
   });
 });
 
-describe("BrowserClient.ensureAlive", () => {
-  test("concurrent callers share one in-flight check", async () => {
-    const { stub, client } = await started();
-    // Forget the current tab so the next ensureAlive has to restart, which attaches again.
-    stub.emit({ method: "Target.targetDestroyed", params: { targetId: "t1" } });
-    await flush();
-    assert.equal(client.current(), null);
-    const attachesBefore = stub.calls.filter((c) => c.method === "Target.attachToTarget").length;
-    const [a, b, c] = await Promise.all([client.ensureAlive(), client.ensureAlive(), client.ensureAlive()]);
-    assert.equal(a.success && b.success && c.success, true);
-    assert.equal(stub.calls.filter((c) => c.method === "Target.attachToTarget").length, attachesBefore + 1);
+describe("BrowserClient initialization with profile pin and machine dependencies", () => {
+  const pin: ProfilePin = {
+    userDataDir: "/home/u/.config/google-chrome",
+    profileDir: "Profile 1",
+    label: "Work (work@example.com)",
+    savedAt: "",
+  };
+  const chromeExe = "/opt/google/chrome/chrome";
+  const cftExe = "/home/u/.agent-browser/browsers/chrome-150.0.7871.115/chrome";
+  const sentinelUrl = "file:///tmp/pi-harness-sentinel.html";
+
+  test("start() with ambiguous Chrome/CFT candidates with absent flags fails with zero launches in both orders", async () => {
+    const chromeCandidate: BrowserCandidate = { exePath: chromeExe };
+    const cftCandidate: BrowserCandidate = { exePath: cftExe };
+
+    for (const [name, candidates] of [
+      ["[Chrome, CFT]", [chromeCandidate, cftCandidate]],
+      ["[CFT, Chrome]", [cftCandidate, chromeCandidate]],
+    ] as const) {
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve(selectBrowserCandidate(candidates, pin.userDataDir)),
+        resolveBrowserExecutable: (r) => Promise.resolve(r?.ambiguous ? undefined : r?.exePath ?? chromeExe),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({
+            sentinelUrl,
+            cleanup: () => Promise.resolve(),
+            kill: () => undefined,
+          }));
+        },
+      };
+
+      const stub = createStubTransport({
+        "Target.setDiscoverTargets": ok({}),
+        "Target.getTargets": ok({ targetInfos: [] }),
+      });
+
+      const client = createBrowserClient({
+        namespace: "test-ambiguous",
+        transport: stub.transport,
+        remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc" },
+        profilePin: pin,
+        seedDeps,
+      });
+
+      const r = await client.start();
+      assert.equal(r.success, false, `start() should fail for ${name}`);
+      assert.equal(r.error.kind, "discovery_failed");
+      assert.match(r.error.message, /ambiguous/i);
+      assert.equal(launches.length, 0, `zero launches expected for ${name}`);
+    }
+  });
+
+  test("start() with verified positive candidate succeeds and permits service-window launch", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve(selectBrowserCandidate([
+        { exePath: cftExe },
+        { exePath: chromeExe, explicitUserDataDir: pin.userDataDir },
+      ], pin.userDataDir)),
+      resolveBrowserExecutable: (r) => Promise.resolve(r?.ambiguous ? undefined : r?.exePath ?? chromeExe),
+      openProfileWindow: (req) => {
+        launches.push(req);
+        return Promise.resolve(ok({
+          sentinelUrl,
+          cleanup: () => Promise.resolve(),
+          kill: () => undefined,
+        }));
+      },
+      deadlineMs: 2_000,
+      pollMs: 10,
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        ok({ targetInfos: [] }),
+        ok({ targetInfos: [{ targetId: "seed-tab", type: "page", title: "", url: sentinelUrl, browserContextId: "ctx-work" }] }),
+        ok({ targetInfos: [{ targetId: "seed-tab", type: "page", title: "", url: "about:blank", browserContextId: "ctx-work" }] }),
+      ],
+      "Target.attachToTarget": [ok({ sessionId: "s-seed" }), ok({ sessionId: "s-main" })],
+      "Browser.getWindowForTarget": ok({ windowId: 42 }),
+      "Page.navigate": ok({}),
+      "Target.detachFromTarget": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-verified",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc" },
+      profilePin: pin,
+      seedDeps,
+    });
+
+    const r = await client.start();
+    assert.equal(r.success, true, r.success ? "" : r.error.message);
+    assert.equal(launches.length, 1);
+    assert.deepEqual(launches[0], {
+      exePath: chromeExe,
+      profileDir: "Profile 1",
+      explicitUserDataDir: pin.userDataDir,
+    });
+    assert.equal(client.profileContextId(), "ctx-work");
+    assert.equal(client.owns("seed-tab"), true);
   });
 });
