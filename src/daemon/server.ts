@@ -100,13 +100,15 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
         const client: ClientSocket = { id: tempId, socket, stopReading, registered: false };
 
         anonymous.set(tempId, client);
+        let registrationPending = false;
 
         function onLine(line: string): void {
           const msg = deserialize(line);
           if (!msg) return;
 
           if (msg.type === "control" && msg.action === "register") {
-            if (client.registered) return;
+            if (client.registered || registrationPending) return;
+            registrationPending = true;
             const clientId = msg.clientId;
 
             if (clients.has(clientId) || reserving.has(clientId)) {
@@ -147,7 +149,7 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
                 // Readiness timeout or failure must not crash server
               }
               if (socket.destroyed || reserving.get(clientId) !== client) {
-                reserving.delete(clientId);
+                if (reserving.get(clientId) === client) reserving.delete(clientId);
                 return;
               }
               reserving.delete(clientId);

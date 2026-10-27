@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { fakeCtx } from "../helpers/fake-pi";
+import { ensureHarnessWindow } from "../../src/cdp/target-factory";
 import { createBrowserClient } from "../../src/client";
 import { cdpError, type CdpError } from "../../src/cdp/errors";
 import { type CdpEvent, type CdpTransport } from "../../src/cdp/types";
@@ -91,6 +92,115 @@ const createMockTransport = (opts: MockTransportOptions = {}): {
 };
 
 describe("BrowserClient initialization failure latching & recovery", () => {
+  test("a profile change during connect latches failure until explicit retry", async () => {
+    const mock = createMockTransport();
+    const client = createBrowserClient({
+      namespace: "generation-latch",
+      transport: mock.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test" },
+    });
+    mock.setConnectResult(() => {
+      client.setProfilePin({ userDataDir: "/isolated/chrome", profileDir: "Default", label: "Test", savedAt: "" });
+      client.setProfilePin(null);
+      return Promise.resolve(ok(undefined));
+    });
+    const first = await client.start();
+    assert.equal(first.success, false);
+    assert.match(first.error.message, /profile pin changed/);
+    for (const result of [await client.start(), await client.ensureAlive(), await client.listTabs()]) {
+      assert.equal(result.success, false);
+      assert.equal(result.error.message, first.error.message);
+    }
+    assert.equal(mock.connectCalls, 1, "ordinary calls must not repeat the cancelled initialization");
+    mock.setConnectResult(() => Promise.resolve(ok(undefined)));
+    assert.equal((await client.start({ retrySetup: true })).success, true);
+    assert.equal(mock.connectCalls, 2);
+    await client.stop();
+  });
+  test("an ABA profile change during target listing cannot create an unpinned window", async () => {
+    const mock = createMockTransport({
+      requestResult: (method) => {
+        if (method === "Target.getTargets") {
+          client.setProfilePin({ userDataDir: "/isolated/chrome", profileDir: "Default", label: "Test", savedAt: "" });
+          client.setProfilePin(null);
+        }
+        return Promise.resolve(undefined);
+      },
+    });
+    const client = createBrowserClient({ namespace: "listing-generation", transport: mock.transport });
+    const result = await ensureHarnessWindow(client);
+    assert.equal(result.success, false);
+    assert.equal(mock.requestCalls.filter((r) => r.method === "Target.createTarget").length, 0);
+    assert.deepEqual(client.ownership().list(), []);
+    assert.equal(client.current(), null);
+  });
+
+  test("a profile change during attach cannot publish a stale current session", async () => {
+    let changed = false;
+    const mock = createMockTransport({
+      requestResult: (method) => {
+        if (method === "Target.attachToTarget" && !changed) {
+          changed = true;
+          client.setProfilePin({ userDataDir: "/isolated/chrome", profileDir: "Default", label: "Test", savedAt: "" });
+          client.setProfilePin(null);
+        }
+        return Promise.resolve(undefined);
+      },
+    });
+    const client = createBrowserClient({
+      namespace: "attach-generation", transport: mock.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test" },
+    });
+    assert.equal((await client.start()).success, false);
+    assert.equal(client.current(), null);
+    assert.deepEqual(client.ownership().list(), []);
+    await client.stop();
+  });
+
+  for (const barrier of ["Browser.getWindowForTarget", "Target.attachToTarget"]) {
+    test(`a profile change at seed ${barrier} cannot publish ownership or navigate`, async () => {
+      const pin: ProfilePin = { userDataDir: "/isolated/chrome", profileDir: "Default", label: "Test", savedAt: "" };
+      const sentinelUrl = "file:///isolated/sentinel.html";
+      let changed = false;
+      let launches = 0;
+      const mock = createMockTransport({
+        actualEndpoint: () => ({ wsUrl: "ws://127.0.0.1:9222/test", browserId: "test", userDataDir: pin.userDataDir }),
+        requestResult: (method) => {
+          if (method === barrier && !changed) {
+            changed = true;
+            client.setProfilePin(null);
+            client.setProfilePin(pin);
+          }
+          if (method === "Target.getTargets") {
+            return Promise.resolve(ok({ targetInfos: [{ targetId: "seed", type: "page", title: "", url: sentinelUrl }] }));
+          }
+          return Promise.resolve(undefined);
+        },
+      });
+      const client = createBrowserClient({
+        namespace: `seed-generation-${barrier}`, transport: mock.transport, profilePin: pin,
+        remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test" },
+        seedDeps: {
+          detectRunningBrowser: () => Promise.resolve({ running: true, exePath: "/fake/chrome", explicitUserDataDir: pin.userDataDir }),
+          resolveBrowserExecutable: () => Promise.resolve("/fake/chrome"),
+          openProfileWindow: () => {
+            launches++;
+            return Promise.resolve(ok({ sentinelUrl, cleanup: () => Promise.resolve(), kill: () => undefined }));
+          },
+        },
+      });
+      assert.equal((await client.start()).success, false);
+      assert.equal(changed, true);
+      assert.equal(launches, 1);
+      assert.deepEqual(client.ownership().list(), []);
+      assert.equal(client.current(), null);
+      assert.equal(mock.requestCalls.some((r) => r.method === "Page.navigate"), false);
+      assert.equal((await client.ensureAlive()).success, false);
+      assert.equal(launches, 1);
+      await client.stop();
+    });
+  }
+
   test("latches initialization failure across sequential ensureAlive and ordinary reads", async () => {
     const mock = createMockTransport({
       connectResult: () => Promise.resolve(err(cdpError("discovery_failed", "No matching Chrome process"))),

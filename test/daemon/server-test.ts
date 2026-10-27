@@ -69,6 +69,42 @@ const register = async (socketPath: string, clientId: string): Promise<Client> =
 };
 
 describe("daemon ipc server", { skip: SKIP }, () => {
+  test("an old readiness completion cannot remove a replacement client's reservation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pbh-reservation-"));
+    const socketPath = join(dir, "d.sock");
+    const gates: Array<() => void> = [];
+    const server = createIpcServer({
+      socketPath,
+      awaitReady: async () => {
+        await new Promise<void>((resolve) => { gates.push(resolve); });
+        return true;
+      },
+    });
+    await server.start();
+    try {
+      const old = await dial(socketPath);
+      send(old, { type: "control", action: "register", clientId: "replacement" });
+      assert.ok(await waitFor(() => gates.length === 1));
+      send(old, { type: "control", action: "register", clientId: "second-id" });
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      assert.equal(gates.length, 1, "one socket may reserve only one identity");
+      old.socket.destroy();
+      assert.ok(await waitFor(() => server.socketCount() === 0));
+      const replacement = await dial(socketPath);
+      send(replacement, { type: "control", action: "register", clientId: "replacement" });
+      assert.ok(await waitFor(() => gates.length === 2));
+      gates[0]?.();
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      gates[1]?.();
+      assert.ok(await waitFor(() => replacement.received.some((m) => m.type === "control" && m.action === "registered")));
+      assert.equal(server.clientCount(), 1);
+      replacement.socket.destroy();
+    } finally {
+      for (const release of gates) release();
+      await server.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   test("every registered disconnect handler runs, and a disposed one does not", async () => {
     const h = await startServer();
     try {
@@ -214,7 +250,7 @@ describe("daemon ipc server", { skip: SKIP }, () => {
         if (readyBlocked) await readyPromise;
         return true;
       },
-      provenance: () => ({ browserId: "b-conc", userDataDir: "/tmp/u", cdpUrl: "ws://conc" }),
+      provenance: () => readyBlocked ? undefined : { browserId: "b-conc", userDataDir: "/tmp/u", cdpUrl: "ws://conc" },
     });
     await server.start();
 
@@ -261,7 +297,7 @@ describe("daemon ipc server", { skip: SKIP }, () => {
         if (readyBlocked) await readyPromise;
         return true;
       },
-      provenance: () => ({ browserId: "b-disc" }),
+      provenance: () => readyBlocked ? undefined : { browserId: "b-disc" },
     });
     await server.start();
 

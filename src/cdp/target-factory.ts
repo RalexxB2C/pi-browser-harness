@@ -106,6 +106,9 @@ export const ensureHarnessWindow = async (client: BrowserClient): Promise<Result
 const ensureHarnessWindowUncoordinated = async (
   client: BrowserClient,
 ): Promise<Result<HarnessWindow, CdpError>> => {
+  const generation = client.profileGeneration();
+  const isCurrent = (): boolean => client.profileGeneration() === generation;
+  const changed = () => err(cdpError("discovery_failed", "profile pin changed during initialization"));
   const pin = client.profilePin();
   if (pin) {
     const idVerified = await client.verifyProfileIdentity();
@@ -114,12 +117,13 @@ const ensureHarnessWindowUncoordinated = async (
     }
     const currentPin = client.profilePin();
     const pinMatches = currentPin !== null && currentPin.profileDir === pin.profileDir && currentPin.userDataDir === pin.userDataDir;
-    if (!pinMatches) {
+    if (!isCurrent() || !pinMatches) {
       return err(cdpError("discovery_failed", "profile pin changed during initialization"));
     }
   }
 
   const targets = await listPageTargets(client);
+  if (!isCurrent()) return changed();
   if (!targets.success) return targets;
   const live = new Set(targets.data.map((t) => t.targetId));
 
@@ -136,7 +140,7 @@ const ensureHarnessWindowUncoordinated = async (
       ownership.setHarnessWindow(survivor);
       return ok({ targetId: survivor, freshlyCreated: false });
     }
-    const seeded = await createDedicatedWindow(client);
+    const seeded = await createDedicatedWindow(client, isCurrent);
     if (!seeded.success) return seeded;
     return ok({ targetId: seeded.data, freshlyCreated: true });
   }
@@ -186,14 +190,16 @@ const ensureHarnessWindowUncoordinated = async (
   return ok({ targetId: seeded.data, freshlyCreated: true });
 };
 
-const createDedicatedWindow = async (client: BrowserClient): Promise<Result<string, CdpError>> => {
+const createDedicatedWindow = async (client: BrowserClient, isCurrent: () => boolean): Promise<Result<string, CdpError>> => {
   const created = await client.session().callBrowser("Target.createTarget", { url: "about:blank", newWindow: true });
+  if (!isCurrent()) return err(cdpError("discovery_failed", "profile pin changed during initialization"));
   if (!created.success) return created;
   const { targetId } = created.data;
   const ownership = client.ownership();
   ownership.setHarnessWindow(targetId);
   ownership.add(targetId);
   const win = await client.session().windowId(targetId);
+  if (!isCurrent()) return err(cdpError("discovery_failed", "profile pin changed during initialization"));
   if (win.success) ownership.setHarnessWindowId(win.data);
   return ok(targetId);
 };

@@ -246,9 +246,15 @@ export const createCdpBridge = (options: ChromeConnectionDependencies = {}): Cdp
         : errorResponse(req.id, describeDisconnected(connection.status())));
       return;
     }
+    const requestedGeneration = connection.generation();
     // Connection attempts happen only in response to explicit browser work.
     if (!connection.isOpen() && !(await connection.connect())) {
       send(clientId, errorResponse(req.id, describeDisconnected(connection.status())));
+      return;
+    }
+
+    if (requestedGeneration !== 0 && requestedGeneration !== connection.generation()) {
+      send(clientId, errorResponse(req.id, "Chrome connection changed; reconnect the client before retrying"));
       return;
     }
 

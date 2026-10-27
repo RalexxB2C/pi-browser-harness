@@ -110,8 +110,9 @@ export const seedProfileWindow = async (
   const deadlineMs = deps.deadlineMs ?? SEED_DEADLINE_MS;
   const pollMs = deps.pollMs ?? SEED_POLL_MS;
 
+  const generation = client.profileGeneration();
   const checkPinValid = (): Result<void, CdpError> => {
-    if (isCurrent && !isCurrent()) {
+    if (client.profileGeneration() !== generation || (isCurrent && !isCurrent())) {
       return err(cdpError("discovery_failed", "profile pin changed during initialization"));
     }
     const current = client.profilePin();
@@ -179,6 +180,14 @@ export const seedProfileWindow = async (
     return preMutationCheck;
   }
 
+  const win = await client.session().windowId(seed.targetId);
+  const prePublishCheck = checkPinValid();
+  if (!prePublishCheck.success) {
+    kill();
+    await cleanup();
+    return prePublishCheck;
+  }
+
   // The sentinel's context is the profile's context — the only way to learn it.
   if (seed.browserContextId) {
     client.setProfileContext({ kind: "named", contextId: seed.browserContextId });
@@ -190,13 +199,18 @@ export const seedProfileWindow = async (
   const ownership = client.ownership();
   ownership.setHarnessWindow(seed.targetId);
   ownership.add(seed.targetId);
-  const win = await client.session().windowId(seed.targetId);
   if (win.success) ownership.setHarnessWindowId(win.data);
 
   // Clears the sentinel URL from the seed tab. The session is borrowed and released so an untracked attach never outlives this call.
   const borrowed = await borrowSession(client, seed.targetId);
   if (borrowed.success) {
     try {
+      const preNavigateCheck = checkPinValid();
+      if (!preNavigateCheck.success) {
+        kill();
+        await cleanup();
+        return preNavigateCheck;
+      }
       await client.session().callOnTarget("Page.navigate", { url: "about:blank" }, borrowed.data.sessionId);
     } finally {
       await borrowed.data.release();

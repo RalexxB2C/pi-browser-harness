@@ -79,6 +79,7 @@ export type BrowserClient = {
   transport(): CdpTransport;
   userDataDir(): string | undefined;
   profilePin(): ProfilePin | null;
+  profileGeneration(): number;
   setProfilePin(pin: ProfilePin | null): void;
   profileContext(): ProfileContext;
   setProfileContext(context: ProfileContext): void;
@@ -181,7 +182,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   const session = createCdpSession(transport, ownership, async () => {
     const window = await ensureHarnessWindow(api);
     return window.success ? ok(window.data.targetId) : window;
-  });
+  }, () => pinGeneration);
   const mutationMutex = createMutex();
   let latchedInitFailure: CdpError | null = null;
   let inFlightInit: Promise<Result<void, CdpError>> | null = null;
@@ -342,7 +343,9 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     const running = (async () => {
       if (isExplicit) inExplicitRetry = true;
       try {
-        return await doStart(opts);
+        const result = await doStart(opts);
+        if (!result.success) latchedInitFailure = result.error;
+        return result;
       } finally {
         inFlightInit = null;
         inExplicitRetry = false;
@@ -581,6 +584,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     transport: () => transport,
     userDataDir: () => userDataDir,
     profilePin: () => profilePin,
+    profileGeneration: () => pinGeneration,
     setProfilePin: (pin) => {
       const changed = !samePin(profilePin, pin);
       profilePin = pin;

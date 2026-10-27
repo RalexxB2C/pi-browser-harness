@@ -72,7 +72,15 @@ export const createCdpSession = (
   transport: CdpTransport,
   ownership?: OwnershipRegistry,
   createSeedTarget?: SeedTargetProvider,
+  profileGeneration: () => number = () => 0,
 ): CdpSession => {
+  let connectionGeneration = 0;
+  const captureBinding = (): (() => boolean) => {
+    const profile = profileGeneration();
+    const connection = connectionGeneration;
+    return () => profileGeneration() === profile && connectionGeneration === connection;
+  };
+  const bindingChanged = () => err(cdpError("discovery_failed", "browser or profile changed during initialization"));
   let sessionId: string | null = null;
   let targetId: string | null = null;
 
@@ -253,6 +261,7 @@ export const createCdpSession = (
 
   restartConsumer();
   transport.onClose(() => {
+    connectionGeneration++;
     // Everything, pending dialogs included, dies with the socket: the sessions those dialogs belonged to no longer exist, so a later takeDialog() correctly sees nothing.
     clearCurrent();
     tabs.clear();
@@ -273,10 +282,12 @@ export const createCdpSession = (
     sid: string | null,
     opts: CallOpts = {},
   ): Promise<Result<ResultOf<M>, CdpError>> => {
+    const isCurrent = captureBinding();
     const raw = await transport.request(method, { ...(params ?? {}) }, {
       sessionId: sid,
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
     });
+    if (!isCurrent()) return bindingChanged();
     if (!raw.success) return raw;
     return decodeResult(method, raw.data);
   };
@@ -293,12 +304,18 @@ export const createCdpSession = (
 
   // Attaches a new session to `tid` with every domain enabled. A previous session on the same target is detached only once the new one is live, so the tab's buffers and refs carry over without leaking the old session.
   const attachFresh = async (tid: string, pageInfoDirty: boolean): Promise<Result<string, CdpError>> => {
+    const isCurrent = captureBinding();
     const previous = tabs.get(tid)?.sessionId;
     const attached = await attach(tid);
     if (!attached.success) return attached;
     const sid = attached.data;
     bindSession(tid, sid, pageInfoDirty);
     const enabled = await enableDomains(sid);
+    if (!isCurrent()) {
+      forgetSession(sid);
+      await detachSession(sid);
+      return bindingChanged();
+    }
     if (!enabled.success) {
       forgetSession(sid);
       await detachSession(sid);
@@ -326,13 +343,16 @@ export const createCdpSession = (
       registry.setHarnessWindowId(undefined);
       return;
     }
+    const isCurrent = captureBinding();
     const anchorWin = await windowId(anchorId);
+    if (!isCurrent()) return;
     if (anchorWin.success) {
       const anchorWindowId = anchorWin.data;
       registry.setHarnessWindowId(anchorWindowId);
       const windows = await Promise.all(
         allPages.map((p) => (p.targetId === anchorId ? Promise.resolve(anchorWin) : windowId(p.targetId))),
       );
+      if (!isCurrent()) return;
       // One replaceAll, one change notification: adding per page would persist state once per tab.
       const adopted = allPages.filter((_, i) => {
         const r = windows[i];
@@ -374,16 +394,21 @@ export const createCdpSession = (
 
   const session: CdpSession = {
     async attachFirstPage() {
+      const isCurrent = captureBinding();
       const pages = await discoverPages();
+      if (!isCurrent()) return bindingChanged();
       if (!pages.success) return pages;
       const live: ReadonlySet<string> = new Set(pages.data.map((p) => p.targetId));
       if (ownership) await adoptHarnessWindowTabs(ownership, pages.data, live);
+      if (!isCurrent()) return bindingChanged();
       pruneDeadTabs(live);
       const picked = await pickOrCreateTarget(live);
+      if (!isCurrent()) return bindingChanged();
       if (!picked.success) return picked;
       const tid = picked.data;
       // Always a fresh session: callers reach this on start or after the current session was reported dead.
       const attached = await attachFresh(tid, false);
+      if (!isCurrent()) return bindingChanged();
       if (!attached.success) return attached;
       setCurrent(tid, attached.data);
       return ok({ targetId: tid, sessionId: attached.data });

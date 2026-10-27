@@ -171,6 +171,7 @@ export const createFakeClient = async (opts: FakeClientOptions = {}): Promise<Fa
     transport: () => stub.transport,
     userDataDir: () => opts.userDataDir,
     profilePin: () => opts.profilePin ?? null,
+    profileGeneration: () => 0,
     setProfilePin: noop,
     profileContext: () => ({ kind: "unresolved" }),
     setProfileContext: noop,
