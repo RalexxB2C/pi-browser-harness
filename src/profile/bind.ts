@@ -36,7 +36,9 @@ const pageTargets = async (client: BrowserClient): Promise<ReadonlyArray<PageTar
 
 export const unlinkedEndpointHint = (pin: ProfilePin): string =>
   `the connected browser endpoint cannot be proven to belong to ${pin.userDataDir}. ` +
-  `Ensure your browser is open with remote debugging enabled for "${pin.label}", then run /browser-setup to reconnect, or run /browser-profile to choose a profile from the connected browser.`;
+  `Ensure remote debugging is enabled for "${pin.label}". If the running daemon is from an older package, disconnect all harness clients and wait for its idle shutdown, or ask the operator to verify and stop only the daemon PID running this package's src/daemon/main.ts. ` +
+  `Then start a new Pi session with the updated package and run /browser-setup. /browser-setup and /browser-reload-daemon do not replace a running legacy daemon. Do not stop Chrome or delete a live daemon socket. ` +
+  `Use /browser-profile to choose a profile from the connected browser if the profile selection is wrong.`;
 
 const manualFallbackHint = (pin: ProfilePin): string =>
   `open a window for "${pin.label}" yourself (browser profile menu → ${pin.profileDir}), then retry. ` +

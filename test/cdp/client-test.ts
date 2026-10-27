@@ -365,13 +365,11 @@ describe("BrowserClient initialization with profile pin and machine dependencies
       discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc" })),
     });
 
-    // Initial start succeeds without blocking
     seedBlocked = false;
     const r1 = await client.start();
     assert.equal(r1.success, true);
     assert.equal(launches.length, 1);
 
-    // Prepare block for reattach seed
     seedBlocked = true;
 
     // Invalidate session and clear ownership so reattach must seed
@@ -394,7 +392,6 @@ describe("BrowserClient initialization with profile pin and machine dependencies
     assert.equal(r2.success, false);
     assert.match(r2.error.message, /profile pin changed/i);
 
-    // Generation failure is latched: subsequent ordinary check returns latched error without retry
     const r3 = await client.ensureAlive();
     assert.equal(r3.success, false);
     assert.match(r3.error.message, /profile pin changed/i);

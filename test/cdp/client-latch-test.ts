@@ -34,6 +34,7 @@ const createMockTransport = (opts: MockTransportOptions = {}): {
   const requestCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
   let connectFn = opts.connectResult ?? (() => Promise.resolve(ok(undefined)));
   let currentState = opts.state ? opts.state() : "closed";
+  const closeListeners = new Set<() => void>();
 
   const transport: CdpTransport = {
     connect: async () => {
@@ -43,7 +44,10 @@ const createMockTransport = (opts: MockTransportOptions = {}): {
       return res;
     },
     close: () => {
-      currentState = "closed";
+      if (currentState !== "closed") {
+        currentState = "closed";
+        for (const listener of closeListeners) listener();
+      }
       return Promise.resolve();
     },
     request: async (method, params) => {
@@ -72,7 +76,10 @@ const createMockTransport = (opts: MockTransportOptions = {}): {
       }),
     }),
     state: () => currentState,
-    onClose: () => () => undefined,
+    onClose: (listener) => {
+      closeListeners.add(listener);
+      return () => { closeListeners.delete(listener); };
+    },
     ...(opts.actualEndpoint ? { actualEndpoint: opts.actualEndpoint } : {}),
   };
 
@@ -197,6 +204,47 @@ describe("BrowserClient initialization failure latching & recovery", () => {
       assert.equal(mock.requestCalls.some((r) => r.method === "Page.navigate"), false);
       assert.equal((await client.ensureAlive()).success, false);
       assert.equal(launches, 1);
+      await client.stop();
+    });
+  }
+
+  for (const phase of ["detect", "resolve"]) {
+    test(`transport closure during seed identity ${phase} prevents OS launch without changing the pin`, async () => {
+      const pin: ProfilePin = { userDataDir: "/isolated/chrome", profileDir: "Default", label: "Test", savedAt: "" };
+      let checks = 0;
+      let resolutions = 0;
+      let launches = 0;
+      const mock = createMockTransport({
+        actualEndpoint: () => mock.transport.state() === "open"
+          ? { wsUrl: "ws://127.0.0.1:9222/test", browserId: "test", userDataDir: pin.userDataDir }
+          : undefined,
+      });
+      const client = createBrowserClient({
+        namespace: `seed-closed-${phase}`, transport: mock.transport, profilePin: pin,
+        remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test" },
+        seedDeps: {
+          detectRunningBrowser: async () => {
+            if (++checks === 2 && phase === "detect") await mock.transport.close();
+            return { running: true, exePath: "/fake/chrome", explicitUserDataDir: pin.userDataDir };
+          },
+          resolveBrowserExecutable: async () => {
+            if (++resolutions === 2 && phase === "resolve") await mock.transport.close();
+            return "/fake/chrome";
+          },
+          openProfileWindow: () => {
+            launches++;
+            return Promise.resolve(err("unexpected OS launch after transport closure"));
+          },
+        },
+      });
+      const result = await client.start();
+      assert.equal(result.success, false);
+      assert.equal(checks, 2);
+      assert.equal(launches, 0);
+      assert.deepEqual(client.profilePin(), pin);
+      assert.equal(client.userDataDir(), undefined);
+      assert.equal((await client.ensureAlive()).success, false);
+      assert.equal(mock.connectCalls, 1);
       await client.stop();
     });
   }

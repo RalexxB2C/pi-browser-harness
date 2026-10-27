@@ -195,6 +195,13 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   let userDataDir: string | undefined;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
 
+  transport.onClose(() => {
+    // Lost endpoint evidence invalidates in-flight profile work even when the pin is unchanged.
+    pinGeneration++;
+    userDataDir = undefined;
+    remote = null;
+  });
+
   let registryProvenance: {
     readonly namespace: string;
     readonly browserId?: string | undefined;

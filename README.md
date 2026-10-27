@@ -46,6 +46,8 @@ or relaunch the browser with `--remote-debugging-port=9222`.
 Finally, run `/browser-setup` in pi to connect. It's a one-time step — the connection survives across
 pi sessions and reconnects on its own when Chrome restarts. If initialization fails, the error is remembered and subsequent reads will not trigger repeated launches; run `/browser-setup` explicitly to recover.
 
+After a package update, an older background daemon can still be running without the browser identity evidence required by a pinned profile. `/browser-setup` and `/browser-reload-daemon` reuse that daemon; neither replaces it. Disconnect all harness clients and wait for its idle shutdown, or ask the operator to verify the process command path and stop only the daemon PID running this package's `src/daemon/main.ts`. Then start a new Pi session with the updated package and run `/browser-setup`. Do not terminate Chrome, stop unrelated processes, or delete the socket of a running daemon.
+
 The first time you connect, you'll be asked which browser profile the agent should work in:
 
 ```

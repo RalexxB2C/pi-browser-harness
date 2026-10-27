@@ -12,7 +12,8 @@ All notable changes to pi-browser-harness will be documented in this file.
 ### Fixed
 
 - Profile changes invalidate in-flight target discovery, seeding, and session publication, including changes away from and back to the same profile. Cancelled initialization stays latched until explicit setup.
-- A request waiting on a closing Chrome connection cannot run on its replacement. Disconnected IPC clients must register again, and an old registration cannot erase a newer client's reservation.
+- A request waiting on a closing Chrome connection cannot run on its replacement. Old IPC registrations are invalidated before admitting work on the replacement, without waiting for the old socket's close event. An old registration cannot erase a newer client's reservation.
+- Losing the transport connection invalidates cached identity and in-flight profile-window launches even when the selected profile has not changed. Legacy-daemon recovery instructions explain how to replace the daemon safely after a package update.
 - **Latched initialization failures with explicit setup recovery.** The client remembers the root cause of an initialization failure. Subsequent ordinary reads return the stored cause immediately without repeating initialization or launching service windows. Only an explicitly requested setup (`/browser-setup`, `browser_setup`, or daemon reconnect) permits a retry.
 - **Root cause preservation on missing daemon socket.** The tool wrapper surfaces the stored initialization failure cause before checking daemon socket existence, preventing premature generic setup error messages.
 

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
 import { createConnection, type Socket } from "node:net";
 import WebSocket, { WebSocketServer } from "ws";
 import { createBrowserClient } from "../../src/client";
@@ -17,7 +18,38 @@ import { readLines } from "../../src/daemon/lines";
 import { ok } from "../../src/util/result";
 import { waitFor } from "../helpers/wait";
 
-test("production lifecycle: cold daemon is live before Chrome is ready; A-to-B reconnect invalidates all clients", {
+class DeferredCloseSocket extends EventEmitter {
+  readonly socket: WebSocket;
+  private holdClose: boolean;
+  private closePending = false;
+
+  constructor(url: string, holdClose: boolean) {
+    super();
+    this.holdClose = holdClose;
+    this.socket = new WebSocket(url);
+    this.socket.on("open", () => { this.emit("open"); });
+    this.socket.on("message", (data) => { this.emit("message", data); });
+    this.socket.on("error", (error) => { this.emit("error", error); });
+    this.socket.on("close", () => {
+      if (this.holdClose) this.closePending = true;
+      else this.emit("close");
+    });
+  }
+
+  get readyState(): number { return this.socket.readyState; }
+  send(data: string): void { this.socket.send(data); }
+  close(): void { this.socket.close(); }
+
+  releaseClose(): void {
+    this.holdClose = false;
+    if (this.closePending) {
+      this.closePending = false;
+      this.emit("close");
+    }
+  }
+}
+
+test("production lifecycle: cold daemon is live before Chrome is ready; A-to-B reconnect invalidates all clients before A closes", {
   skip: process.platform === "win32" ? "temporary Unix socket fixture" : false,
   timeout: 10_000,
 }, async () => {
@@ -55,9 +87,9 @@ test("production lifecycle: cold daemon is live before Chrome is ready; A-to-B r
     wsUrl: `ws://127.0.0.1:${address.port}/devtools/browser/${browser}`,
     userDataDir: `/isolated/browser-${browser}`,
   });
-  let activeSocket: WebSocket | undefined;
+  let activeSocket: DeferredCloseSocket | undefined;
   const bridge = createCdpBridge({
-    createWebSocket: (url) => { activeSocket = new WebSocket(url); return activeSocket; },
+    createWebSocket: (url) => { activeSocket = new DeferredCloseSocket(url, url.endsWith("/A")); return activeSocket; },
     discoverEndpoint: async () => { await discoveryGate; return ok(endpoint()); },
     connectTimeoutMs: 2_000,
   });
@@ -105,7 +137,8 @@ test("production lifecycle: cold daemon is live before Chrome is ready; A-to-B r
     assert.ok(await waitFor(() => methods.includes("Runtime.evaluate")));
     browser = "B";
     assert.ok(activeSocket);
-    activeSocket.close();
+    const oldSocket = activeSocket;
+    oldSocket.close();
     const reconnectReplies: WireResponse[] = [];
     await bridge.handleRequest({ type: "request", id: 999, method: "Target.createTarget", params: { url: "about:blank" } }, "lifecycle-client", (_id, reply) => { if (reply.type === "response") reconnectReplies.push(reply); });
     assert.ok(await waitFor(() => reconnectReplies.length === 1));
@@ -124,6 +157,17 @@ test("production lifecycle: cold daemon is live before Chrome is ready; A-to-B r
     assert.match(retry.error.message, /browser-A.*browser-B/);
     assert.deepEqual(client.ownership().list(), []);
     assert.equal(launches, 0, "profile A must not spawn a window through B");
+    const fresh = createDaemonTransport("new-client-B", socketPath);
+    try {
+      assert.equal((await fresh.connect("")).success, true);
+      assert.equal(fresh.actualEndpoint?.()?.browserId, "B");
+      oldSocket.releaseClose();
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      assert.equal((await fresh.request("Target.getTargets", {})).success, true,
+        "A's late close must not invalidate clients registered on B");
+    } finally {
+      await fresh.close();
+    }
   } finally {
     releaseDiscovery();
     staleSocket?.destroy();

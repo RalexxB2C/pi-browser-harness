@@ -70,7 +70,6 @@ type Attempt = {
   socket: ChromeSocket | null;
   opened: boolean;
   ended: boolean;
-  superseded: boolean;
   failure: string | null;
   readonly settle: (opened: boolean) => void;
   readonly end: (reason: ConnectionEndReason) => void;
@@ -188,7 +187,6 @@ export const createChromeConnection = (
       socket: null,
       opened: false,
       ended: false,
-      superseded: false,
       failure: null,
       settle: (opened) => {
         if (settled) return;
@@ -237,7 +235,7 @@ export const createChromeConnection = (
     attempt.socket = socket;
 
     const endFromSocket = (): void => {
-      attempt.end(!attempt.opened ? "failed" : attempt.superseded ? "superseded" : "dropped");
+      attempt.end(!attempt.opened ? "failed" : "dropped");
     };
 
     socket.on("open", () => {
@@ -279,10 +277,8 @@ export const createChromeConnection = (
       // A dial in flight is shared: joining it is what keeps Chrome's prompt count at one.
       if (!current.opened) return waitAtMost(current.settledPromise, connectTimeoutMs);
       if (isOpen()) return Promise.resolve(true);
-      // Opened once but closing now: Chrome is going away and the close event has not arrived
-      // yet. Start a fresh attempt at once; the old socket's close still fails its own requests.
-      current.superseded = true;
-      current = null;
+      // Invalidate old registrations before a replacement browser can accept their requests.
+      current.end("superseded");
     }
     if (inCooldown()) return Promise.resolve(false);
 

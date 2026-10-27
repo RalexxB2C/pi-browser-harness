@@ -271,11 +271,9 @@ describe("daemon transport", { skip: SKIP }, () => {
       const transport = createDaemonTransport("client-forgery", daemon.socketPath);
       await transport.connect("");
 
-      // Send arbitrary CDP command
       const res = await transport.request("Runtime.evaluate", { expression: "1" });
       assert.equal(res.success, true);
 
-      // Provenance MUST NOT be altered by arbitrary CDP response
       assert.deepEqual(transport.actualEndpoint?.(), {
         browserId: "b-daemon-real",
         userDataDir: "/home/u/.config/real-chrome",
@@ -318,11 +316,9 @@ describe("daemon transport", { skip: SKIP }, () => {
       await transport.connect("");
       assert.ok(transport.actualEndpoint?.());
 
-      // Send Daemon.reconnect
       const res = await transport.request(DAEMON_RECONNECT_METHOD, {});
       assert.equal(res.success, true);
 
-      // Provenance snapshot MUST be cleared when control response lacks evidence
       assert.equal(transport.actualEndpoint?.(), undefined);
 
       await transport.close();

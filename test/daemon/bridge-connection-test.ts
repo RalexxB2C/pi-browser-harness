@@ -569,7 +569,8 @@ const testOldGenerationCloseDoesNotAffectNewCallbacks = async (): Promise<void> 
     return;
   }
 
-  check(!responses.some((msg) => msg.id === 31), "old generation callback is pending before close");
+  check(responses.some((msg) => msg.id === 31 && msg.error !== undefined),
+    "old generation callback is rejected without waiting for the delayed close event");
 
   second.message(JSON.stringify({ id: newChromeId, result: { ok: true } }));
   check(
