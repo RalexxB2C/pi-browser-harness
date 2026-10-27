@@ -187,7 +187,6 @@ describe("BrowserClient initialization failure latching & recovery", () => {
     assert.equal(r2.error.kind, "timeout");
     assert.equal(r3.error.kind, "timeout");
 
-    // Latch is preserved afterwards
     const followUp = await client.ensureAlive();
     assert.equal(followUp.success, false);
     assert.equal(connectAttempts, 1);
@@ -385,7 +384,6 @@ describe("BrowserClient initialization failure latching & recovery", () => {
     assert.equal(reconnectAttempt.error.message, "Browser crashed");
     assert.equal(connectCalls, 2);
 
-    // Subsequent ensureAlive must NOT attempt reconnect again; latched!
     const followUp = await client.ensureAlive();
     assert.equal(followUp.success, false);
     assert.equal(followUp.error.message, "Browser crashed");

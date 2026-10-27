@@ -154,6 +154,7 @@ export const createChromeConnection = (
   let nextCooldownMs = cooldownMs;
   let lastFailure: string | null = null;
   let activeProvenance: { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
+  let provenanceGeneration = 0;
 
   const inCooldown = (): boolean => now() < cooldownUntil;
 
@@ -200,7 +201,9 @@ export const createChromeConnection = (
         if (attempt.ended) return;
         attempt.ended = true;
         if (current === attempt) current = null;
-        activeProvenance = undefined;
+        if (provenanceGeneration === generation) {
+          activeProvenance = undefined;
+        }
         if (attempt.socket) closeSocket(attempt.socket);
         if (reason === "failed") recordFailure(attempt);
         attempt.settle(false);
@@ -248,6 +251,7 @@ export const createChromeConnection = (
       }
       attempt.opened = true;
       activeProvenance = { browserId, cdpUrl: wsUrl, ...(userDataDir !== undefined ? { userDataDir } : {}) };
+      provenanceGeneration = attempt.generation;
       recordSuccess();
       console.log("[pi-browser-daemon] Connected to Chrome ✓");
       attempt.settle(true);

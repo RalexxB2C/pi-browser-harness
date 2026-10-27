@@ -2,6 +2,7 @@ import { createConnection, type Socket } from "node:net";
 import { readLines } from "./lines";
 import { destroyQuietly } from "./socket";
 import { type Result, err, ok } from "../util/result";
+import { isRecord } from "../util/guards";
 import { type CdpError, cdpError, classifyRemoteError } from "../cdp/errors";
 import { DEFAULT_TIMEOUT_MS, type CdpTransport } from "../cdp/types";
 import type { CdpEvent } from "../cdp/types";
@@ -116,6 +117,19 @@ export const createDaemonTransport = (clientId: string, socketPath: string = dae
             if (msg.error) {
               p.resolve(err(cdpError(classifyRemoteError(msg.error.message), msg.error.message, p.method)));
             } else {
+              if (isRecord(msg.result)) {
+                const res = msg.result;
+                const bId = typeof res["browserId"] === "string" ? res["browserId"] : undefined;
+                const uDir = typeof res["userDataDir"] === "string" ? res["userDataDir"] : undefined;
+                const cUrl = typeof res["cdpUrl"] === "string" ? res["cdpUrl"] : undefined;
+                if (bId !== undefined || uDir !== undefined || cUrl !== undefined) {
+                  actualEndpointInfo = {
+                    ...(bId !== undefined ? { browserId: bId } : {}),
+                    ...(uDir !== undefined ? { userDataDir: uDir } : {}),
+                    ...(cUrl !== undefined ? { wsUrl: cUrl } : {}),
+                  };
+                }
+              }
               p.resolve(ok(msg.result));
             }
             return;

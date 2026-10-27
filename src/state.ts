@@ -105,13 +105,13 @@ export const restoreState = (ctx: ExtensionContext, currentNamespace?: string): 
     if (entry?.type === "custom" && entry.customType === "browser-harness-state") {
       const data = asPersistedState(entry.data);
       if (data) {
-        if (currentNamespace !== undefined && data.namespace !== undefined && data.namespace !== currentNamespace) {
+        if (data.namespace === undefined || (currentNamespace !== undefined && data.namespace !== currentNamespace)) {
           return fallback;
         }
         return {
           ...fallback,
           ...data,
-          namespace: currentNamespace ?? data.namespace ?? fallback.namespace,
+          namespace: data.namespace,
         };
       }
     }

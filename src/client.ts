@@ -5,7 +5,7 @@ import { parseJson } from "./schemas/parse";
 import { type Result, err, ok } from "./util/result";
 import { safeJs } from "./util/js-template";
 import { type Mutex, createMutex } from "./util/mutex";
-import { discoverEndpoint } from "./cdp/discovery";
+import { discoverEndpoint, type CdpEndpoint } from "./cdp/discovery";
 import { type CdpError, cdpError } from "./cdp/errors";
 import type { CdpTransport } from "./cdp/types";
 import { type CdpSession, createCdpSession } from "./cdp/session";
@@ -50,6 +50,7 @@ export type BrowserClientOptions = {
     readonly profileContext?: ProfileContext | undefined;
   }) => void;
   readonly seedDeps?: SeedDeps;
+  readonly discoverEndpoint?: () => Promise<Result<CdpEndpoint, CdpError>>;
 };
 
 export type BrowserClient = {
@@ -168,12 +169,25 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   let latchedInitFailure: CdpError | null = null;
   let inFlightInit: Promise<Result<void, CdpError>> | null = null;
   let inExplicitRetry = false;
+  let pinGeneration = 0;
   let lastHealth = 0;
   let healthCheck: Promise<Result<void, CdpError>> | null = null;
   const pageCaches = new Map<string, { readonly info: PageInfo; readonly at: number }>();
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
   let userDataDir: string | undefined = opts.remote?.userDataDir;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
+
+  let registryProvenance: {
+    readonly namespace: string;
+    readonly browserId?: string | undefined;
+    readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string } | undefined;
+  } | null = opts.initialOwnership?.namespace
+    ? {
+        namespace: opts.initialOwnership.namespace,
+        browserId: opts.initialOwnership.browserId,
+        profilePin: opts.initialOwnership.profilePin,
+      }
+    : null;
 
   // With a pin set the window must exist BEFORE anything attaches, or attachFirstPage's bare Target.createTarget lands in the focus-derived default profile.
   const seedIfPinned = async (): Promise<Result<void, CdpError>> => {
@@ -186,17 +200,19 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   const doStart = async (
     startOpts: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean } = {},
   ): Promise<Result<void, CdpError>> => {
+    const currentPinGen = pinGeneration;
     if (transport.state() === "open" && session.current()) {
       latchedInitFailure = null;
       return ok(undefined);
     }
     let wsUrl: string;
     let transportUserDataDir: string | undefined;
-    if (remote?.cdpUrl) {
-      wsUrl = remote.cdpUrl;
-      transportUserDataDir = remote.userDataDir;
+    if (opts.remote?.cdpUrl) {
+      wsUrl = opts.remote.cdpUrl;
+      transportUserDataDir = opts.remote.userDataDir;
     } else {
-      const discovered = await discoverEndpoint();
+      const discover = opts.discoverEndpoint ?? discoverEndpoint;
+      const discovered = await discover();
       if (!discovered.success) {
         latchedInitFailure = discovered.error;
         return discovered;
@@ -220,20 +236,18 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     }
 
     const actual = transport.actualEndpoint?.();
-    if (actual?.wsUrl) {
-      wsUrl = actual.wsUrl;
-    }
-    if (actual?.userDataDir !== undefined) {
+    let newBrowserId: string;
+    if (actual) {
+      if (actual.wsUrl) wsUrl = actual.wsUrl;
       transportUserDataDir = actual.userDataDir;
+      newBrowserId = actual.browserId ?? (actual.wsUrl ? actual.wsUrl.split("/").pop() ?? "unknown" : "unknown");
+    } else {
+      newBrowserId = opts.remote ? (wsUrl.split("/").pop() ?? "unknown") : "unknown";
     }
 
-    const newBrowserId: string =
-      actual?.browserId ??
-      (actual?.wsUrl ? actual.wsUrl.split("/").pop() ?? "unknown" : undefined) ??
-      (wsUrl.split("/").pop() ?? "unknown");
+    // Clear old proof each attempt: never let stale remote authorize spawn or reuse
     userDataDir = transportUserDataDir;
 
-    const expectedBrowserId = remote?.browserId ?? opts.initialOwnership?.browserId;
     const samePin = (
       a?: { readonly userDataDir: string; readonly profileDir: string } | null,
       b?: ProfilePin | null,
@@ -242,29 +256,34 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       if (!a || !b) return false;
       return a.userDataDir === b.userDataDir && a.profileDir === b.profileDir;
     };
-    const browserMatches = Boolean(
-      opts.initialOwnership &&
-      expectedBrowserId &&
-      expectedBrowserId === newBrowserId &&
-      newBrowserId !== "unknown",
-    );
-    const pinMatches = Boolean(
-      opts.initialOwnership &&
-      (profilePin !== null
-        ? opts.initialOwnership.profilePin !== undefined && samePin(opts.initialOwnership.profilePin, profilePin)
-        : opts.initialOwnership.profilePin === undefined),
-    );
-    const namespaceMatches = opts.initialOwnership?.namespace === opts.namespace;
 
-    if (opts.initialOwnership) {
+    if (registryProvenance !== null) {
+      const browserMatches = Boolean(
+        registryProvenance.browserId &&
+        registryProvenance.browserId === newBrowserId &&
+        newBrowserId !== "unknown",
+      );
+      const pinMatches =
+        profilePin !== null
+          ? registryProvenance.profilePin !== undefined && samePin(registryProvenance.profilePin, profilePin)
+          : registryProvenance.profilePin === undefined;
+      const namespaceMatches = registryProvenance.namespace === opts.namespace;
+
       if (!browserMatches || !pinMatches || !namespaceMatches) {
         profileContext = { kind: "unresolved" };
         profileContextId = undefined;
         ownership.replaceAll([]);
         ownership.setHarnessWindow(undefined);
         ownership.setHarnessWindowId(undefined);
+        registryProvenance = null;
       }
     }
+
+    if (pinGeneration !== currentPinGen) {
+      await transport.close();
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+
     remote = { cdpUrl: wsUrl, browserId: newBrowserId, ...(userDataDir ? { userDataDir } : {}) };
     const seeded = await seedIfPinned();
     if (!seeded.success) {
@@ -272,12 +291,30 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       await transport.close();
       return seeded;
     }
+
+    if (pinGeneration !== currentPinGen) {
+      await transport.close();
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+
     const attached = await session.attachFirstPage();
     if (!attached.success) {
       latchedInitFailure = attached.error;
       await transport.close();
       return attached;
     }
+
+    if (pinGeneration !== currentPinGen) {
+      await transport.close();
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+
+    registryProvenance = {
+      namespace: opts.namespace,
+      browserId: newBrowserId !== "unknown" ? newBrowserId : undefined,
+      profilePin: profilePin ? { userDataDir: profilePin.userDataDir, profileDir: profilePin.profileDir } : undefined,
+    };
+
     latchedInitFailure = null;
     lastHealth = Date.now();
     pageCaches.clear();
@@ -308,6 +345,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const stop = async (): Promise<void> => {
+    await session.detachAll();
     await transport.close();
     pageCaches.clear();
     lastHealth = 0;
@@ -527,11 +565,13 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
         : profilePin?.userDataDir !== pin.userDataDir || profilePin.profileDir !== pin.profileDir;
       profilePin = pin;
       if (changed) {
+        pinGeneration++;
         ownership.replaceAll([]);
         ownership.setHarnessWindow(undefined);
         ownership.setHarnessWindowId(undefined);
         profileContext = { kind: "unresolved" };
         profileContextId = undefined;
+        registryProvenance = null;
         pageCaches.clear();
         lastHealth = 0;
         void detach();

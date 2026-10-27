@@ -34,6 +34,9 @@ const pageTargets = async (client: BrowserClient): Promise<ReadonlyArray<PageTar
   );
 };
 
+export const legacyDaemonHint = (): string =>
+  "the running browser daemon is using an older version without transport provenance. Restart the daemon with /browser-reload-daemon or restart pi to update.";
+
 const manualFallbackHint = (pin: ProfilePin): string =>
   `open a window for "${pin.label}" yourself (browser profile menu → ${pin.profileDir}), then retry. ` +
   `Run /browser-profile to pick a different profile, or clear the selection to use whichever window is focused.`;
@@ -50,7 +53,7 @@ export const verifyConnectedBrowserIdentity = async (
   if (!connectedDir) {
     return err(cdpError(
       "discovery_failed",
-      `could not verify connected browser identity for "${pin.label}": connected browser has no verified user-data-dir endpoint linkage — ${manualFallbackHint(pin)}`,
+      `could not verify connected browser identity for "${pin.label}": connected browser has no verified user-data-dir endpoint linkage — ${legacyDaemonHint()}`,
     ));
   }
   if (connectedDir !== pin.userDataDir) {
@@ -123,6 +126,12 @@ export const seedProfileWindow = async (
   const deadline = now() + deadlineMs;
   let seed: PageTarget | undefined;
   while (now() < deadline && !seed) {
+    const current = client.profilePin();
+    if (current !== null && (current.profileDir !== pin.profileDir || current.userDataDir !== pin.userDataDir)) {
+      kill();
+      await cleanup();
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
     await sleep(pollMs);
     seed = (await pageTargets(client)).find((t) => t.url === sentinelUrl);
   }

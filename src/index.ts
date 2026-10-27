@@ -11,6 +11,8 @@ import { cleanupTempDirs } from "./util/truncate";
 import { restoreDownloadBehavior } from "./domains/files";
 import { createDaemonTransport } from "./daemon/transport";
 import type { CdpTransport } from "./cdp/types";
+import type { CdpEndpoint } from "./cdp/discovery";
+import type { CdpError } from "./cdp/errors";
 import { setDebugClicks } from "./util/debug";
 import { asBoolean, asString } from "./util/guards";
 import type { BrowserTool } from "./util/tool";
@@ -55,6 +57,7 @@ export type ExtensionDeps = {
   readonly createClient?: (opts: BrowserClientOptions) => BrowserClient;
   readonly readPin?: () => Promise<ProfilePin | null>;
   readonly seedDeps?: SeedDeps;
+  readonly discoverEndpoint?: () => Promise<Result<CdpEndpoint, CdpError>>;
 };
 
 export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) => void) => (pi: ExtensionAPI): void => {
@@ -172,6 +175,7 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
         namespace: restored.namespace,
         transport,
         profilePin,
+        ...(deps.discoverEndpoint ? { discoverEndpoint: deps.discoverEndpoint } : {}),
         ...(deps.seedDeps ? { seedDeps: deps.seedDeps } : {}),
         ...(Object.keys(initialOwnership).length > 0 ? { initialOwnership } : {}),
         onOwnershipChange: (snap) => {

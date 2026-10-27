@@ -230,8 +230,18 @@ export const createCdpBridge = (options: ChromeConnectionDependencies = {}): Cdp
     // The one request the daemon answers itself: a human asked for a fresh dial.
     if (req.method === DAEMON_RECONNECT_METHOD) {
       const open = await connection.reconnectNow();
+      const prov = open ? connection.provenance() : undefined;
       send(clientId, open
-        ? { type: "response", id: req.id, result: { connected: true } }
+        ? {
+            type: "response",
+            id: req.id,
+            result: {
+              connected: true,
+              ...(prov?.browserId !== undefined ? { browserId: prov.browserId } : {}),
+              ...(prov?.userDataDir !== undefined ? { userDataDir: prov.userDataDir } : {}),
+              ...(prov?.cdpUrl !== undefined ? { cdpUrl: prov.cdpUrl } : {}),
+            },
+          }
         : errorResponse(req.id, describeDisconnected(connection.status())));
       return;
     }

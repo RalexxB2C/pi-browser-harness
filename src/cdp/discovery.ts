@@ -215,6 +215,19 @@ export const discoverEndpoint = async (): Promise<Result<CdpEndpoint, CdpError>>
   if (ready.success) {
     const c = ready.data;
     const liveUrl = await queryLiveWsUrl(c.port);
+    if (liveUrl) {
+      try {
+        const livePath = new URL(liveUrl).pathname;
+        const portFilePath = c.path.startsWith("/") ? c.path : `/${c.path}`;
+        if (livePath !== portFilePath) {
+          // Stale DevToolsActivePort: the live endpoint on this port does not match the file's browser path.
+          // Fail closed regarding directory linkage: do not pair this endpoint with an unverified user-data-dir.
+          return ok({ wsUrl: liveUrl });
+        }
+      } catch {
+        return ok({ wsUrl: liveUrl });
+      }
+    }
     return ok({ wsUrl: liveUrl ?? `ws://127.0.0.1:${c.port}${c.path}`, userDataDir: c.userDataDir });
   }
 

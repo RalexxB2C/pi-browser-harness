@@ -384,6 +384,7 @@ describe("createExtension wiring", () => {
         createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
         readPin: () => Promise.resolve(extPin),
         seedDeps,
+        discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-entry" })),
       });
 
       const pi = fakePi();
@@ -448,6 +449,7 @@ describe("createExtension wiring", () => {
         createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
         readPin: () => Promise.resolve(extPin),
         seedDeps,
+        discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-legacy" })),
       });
 
       const pi = fakePi();
@@ -499,6 +501,7 @@ describe("createExtension wiring", () => {
         createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
         readPin: () => Promise.resolve(extPin),
         seedDeps,
+        discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/discovered-A", userDataDir: extPin.userDataDir })),
       });
 
       const pi = fakePi();
@@ -547,14 +550,12 @@ describe("createExtension wiring", () => {
 
     const branch: Array<{ type: string; customType: string; data: unknown }> = [];
     const ctx1 = fakeCtx({ branch });
-    // Intercept appendEntry to record into branch
     pi1.pi.appendEntry = (customType: string, data: unknown) => {
       branch.push({ type: "custom", customType, data });
     };
 
     await pi1.emit("session_start", { type: "session_start" }, ctx1.ctx);
 
-    // Initial state with a window
     capturedOnOwnershipChange?.({
       browserId: "b1",
       userDataDir: PIN.userDataDir,
@@ -569,7 +570,6 @@ describe("createExtension wiring", () => {
     const firstSaved = isRecord(branch[0]?.data) ? branch[0].data : {};
     assert.equal(firstSaved["harnessWindowTargetId"], "w1");
 
-    // Clearing the harness window (e.g. pin changed or cleared)
     capturedOnOwnershipChange?.({
       browserId: "b1",
       userDataDir: PIN.userDataDir,
@@ -584,7 +584,6 @@ describe("createExtension wiring", () => {
     const secondSaved = isRecord(branch[1]?.data) ? branch[1].data : {};
     assert.equal(secondSaved["harnessWindowTargetId"], undefined);
 
-    // Session 2: fresh createExtension instance restores from the updated branch
     let session2InitialOwnership: BrowserClientOptions["initialOwnership"];
     const extension2 = createExtension({
       createTransport: () => createStubTransport().transport,

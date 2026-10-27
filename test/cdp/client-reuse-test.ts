@@ -638,4 +638,182 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     assert.equal(client.current()?.targetId, "seed-def");
     assert.equal(launches.length, 1, "must launch window for Default profile");
   });
+
+  test("X2: client without constructor initialOwnership tracks registry provenance: stop/start same browser reuses with zero launches, different browser invalidates", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: workPin.userDataDir });
+
+    let activeBrowserId = "browser-1";
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        // 1. Initial start before seed: empty
+        ok({ targetInfos: [] }),
+        // 2. Initial start seed poll: sentinel
+        ok({ targetInfos: [{ targetId: "seed-1", type: "page", title: "", url: sentinelUrl, browserContextId: "ctx-work" }] }),
+        // 3. Initial start attachFirstPage: about:blank
+        ok({ targetInfos: [{ targetId: "seed-1", type: "page", title: "Work", url: "about:blank", browserContextId: "ctx-work" }] }),
+        // 4. Same-browser restart ensureHarnessWindow checks existing
+        ok({ targetInfos: [{ targetId: "seed-1", type: "page", title: "Work", url: "about:blank", browserContextId: "ctx-work" }] }),
+        // 5. Same-browser restart attachFirstPage
+        ok({ targetInfos: [{ targetId: "seed-1", type: "page", title: "Work", url: "about:blank", browserContextId: "ctx-work" }] }),
+        // 6. Browser 2 ensureHarnessWindow: coincidental unowned tab in B2
+        ok({ targetInfos: [{ targetId: "seed-1", type: "page", title: "Foreign in B2", url: "https://foreign.test/" }] }),
+        // 7. Browser 2 seed poll: sentinel
+        ok({ targetInfos: [
+          { targetId: "seed-1", type: "page", title: "Foreign in B2", url: "https://foreign.test/" },
+          { targetId: "seed-2", type: "page", title: "", url: sentinelUrl, browserContextId: "ctx-work" },
+        ] }),
+        // 8. Browser 2 attachFirstPage: about:blank
+        ok({ targetInfos: [
+          { targetId: "seed-1", type: "page", title: "Foreign in B2", url: "https://foreign.test/" },
+          { targetId: "seed-2", type: "page", title: "", url: "about:blank", browserContextId: "ctx-work" },
+        ] }),
+      ],
+      "Target.attachToTarget": [
+        ok({ sessionId: "s-seed1" }),
+        ok({ sessionId: "s-main1" }),
+        ok({ sessionId: "s-main1-restart" }),
+        ok({ sessionId: "s-seed2" }),
+        ok({ sessionId: "s-main2" }),
+      ],
+      "Browser.getWindowForTarget": [
+        ok({ windowId: 10 }),
+        ok({ windowId: 10 }),
+        ok({ windowId: 10 }),
+        ok({ windowId: 20 }),
+        ok({ windowId: 20 }),
+        ok({ windowId: 999 }),
+      ],
+      "Page.navigate": ok({}),
+      "Target.detachFromTarget": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    });
+
+    const dynamicTransport = {
+      ...stub.transport,
+      actualEndpoint: () => ({
+        wsUrl: `ws://127.0.0.1:9222/devtools/browser/${activeBrowserId}`,
+        browserId: activeBrowserId,
+        userDataDir: workPin.userDataDir,
+      }),
+    };
+
+    // No constructor initialOwnership!
+    const client = createBrowserClient({
+      namespace: "test-dynamic-provenance",
+      transport: dynamicTransport,
+      profilePin: workPin,
+      seedDeps,
+    });
+
+    // 1. Initial start seeds window in browser-1
+    const r1 = await client.start();
+    assert.equal(r1.success, true);
+    assert.equal(launches.length, 1, "initial start must seed 1 window");
+    assert.equal(client.owns("seed-1"), true);
+
+    // 2. Stop client
+    await client.stop();
+
+    // 3. Restart client against SAME browser-1
+    const r2 = await client.start();
+    assert.equal(r2.success, true);
+    assert.equal(launches.length, 1, "same browser restart must reuse existing window with zero launches");
+    assert.equal(client.owns("seed-1"), true);
+
+    // 4. Stop client
+    await client.stop();
+
+    // 5. Browser changes to browser-2
+    activeBrowserId = "browser-2";
+
+    const r3 = await client.start();
+    assert.equal(r3.success, true);
+    assert.equal(launches.length, 2, "browser change must invalidate old registry and launch new window in B2");
+    assert.equal(client.owns("seed-1"), false, "old window must be cleared on browser change");
+    assert.equal(client.owns("seed-2"), true, "must own new window in B2");
+  });
+
+  test("R4: profile pin change during in-flight seed invalidates publication and does not adopt old context under new pin", async () => {
+    let seedBlocked = true;
+    let seedResolved: () => void = () => undefined;
+    const seedBlockPromise = new Promise<void>((resolve) => {
+      seedResolved = resolve;
+    });
+
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve({
+        running: true,
+        exePath: chromeExe,
+        explicitUserDataDir: workPin.userDataDir,
+      }),
+      resolveBrowserExecutable: () => Promise.resolve(chromeExe),
+      openProfileWindow: async (req) => {
+        launches.push(req);
+        if (seedBlocked) {
+          await seedBlockPromise;
+        }
+        return ok({ sentinelUrl: "file:///tmp/sentinel-race.html", cleanup: () => Promise.resolve(), kill: () => undefined });
+      },
+      deadlineMs: 2_000,
+      pollMs: 10,
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        ok({ targetInfos: [{ targetId: "seed-race", type: "page", title: "", url: "file:///tmp/sentinel-race.html", browserContextId: "ctx-work" }] }),
+        ok({ targetInfos: [{ targetId: "seed-race", type: "page", title: "", url: "about:blank", browserContextId: "ctx-work" }] }),
+      ],
+      "Target.attachToTarget": [ok({ sessionId: "s-race" })],
+      "Browser.getWindowForTarget": ok({ windowId: 99 }),
+      "Page.navigate": ok({}),
+      "Target.detachFromTarget": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    });
+
+    const transport = {
+      ...stub.transport,
+      actualEndpoint: () => ({
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/b1",
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+      }),
+    };
+
+    const client = createBrowserClient({
+      namespace: "test-pin-race",
+      transport,
+      profilePin: workPin,
+      seedDeps,
+      discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b1" })),
+    });
+
+    // Start in-flight seed for Work pin
+    const inFlightStart = client.start();
+
+    // Wait a tick so seed is running and blocked in openProfileWindow
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(launches.length, 1);
+
+    // Profile pin is changed to Default while seed is still in flight!
+    client.setProfilePin(defaultPin);
+    assert.equal(client.profilePin()?.profileDir, "Default");
+
+    // Now let the old seed complete
+    seedBlocked = false;
+    seedResolved();
+
+    // The in-flight start MUST fail with discovery_failed and must NOT publish work window under Default pin
+    const r = await inFlightStart;
+    assert.equal(r.success, false);
+    assert.match(r.error.message, /profile pin changed/i);
+    assert.equal(client.owns("seed-race"), false, "old seed tab must NOT be owned under new pin");
+    assert.equal(client.ownership().harnessWindow(), undefined);
+    assert.equal(client.profileContext().kind, "unresolved");
+  });
 });
