@@ -39,7 +39,7 @@ export type BrowserClient = {
   status(): DaemonStatus;
   // `reconnectNow` is for explicit human demand (/browser-setup, /browser-reload-daemon): it asks the
   // daemon to dial Chrome immediately even if it is cooling down after a failed attempt.
-  start(opts?: { readonly reconnectNow?: boolean }): Promise<Result<void, CdpError>>;
+  start(opts?: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean }): Promise<Result<void, CdpError>>;
   stop(): Promise<void>;
   detach(): Promise<void>;
   closeOwnedTabs(): Promise<void>;
@@ -126,6 +126,8 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     return window.success ? ok(window.data.targetId) : window;
   });
   const mutationMutex = createMutex();
+  let latchedInitFailure: CdpError | null = null;
+  let inFlightInit: Promise<Result<void, CdpError>> | null = null;
   let lastHealth = 0;
   let healthCheck: Promise<Result<void, CdpError>> | null = null;
   const pageCaches = new Map<string, { readonly info: PageInfo; readonly at: number }>();
@@ -142,24 +144,36 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     return ok(undefined);
   };
 
-  const start = async (opts: { readonly reconnectNow?: boolean } = {}): Promise<Result<void, CdpError>> => {
-    if (transport.state() === "open" && session.current()) return ok(undefined);
+  const doStart = async (
+    opts: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean } = {},
+  ): Promise<Result<void, CdpError>> => {
+    if (transport.state() === "open" && session.current()) {
+      latchedInitFailure = null;
+      return ok(undefined);
+    }
     let wsUrl: string;
     if (remote?.cdpUrl) {
       wsUrl = remote.cdpUrl;
     } else {
       const discovered = await discoverEndpoint();
-      if (!discovered.success) return discovered;
+      if (!discovered.success) {
+        latchedInitFailure = discovered.error;
+        return discovered;
+      }
       wsUrl = discovered.data.wsUrl;
       userDataDir = discovered.data.userDataDir;
     }
     const connected = await transport.connect(wsUrl, { timeoutMs: 10_000 });
-    if (!connected.success) return connected;
+    if (!connected.success) {
+      latchedInitFailure = connected.error;
+      return connected;
+    }
     if (opts.reconnectNow) {
       // Only the daemon understands this; a direct Chrome transport answers "method not found",
       // which is fine because it has no cooldown to clear.
       const dialed = await transport.request(DAEMON_RECONNECT_METHOD, {}, { timeoutMs: 15_000 });
       if (!dialed.success && dialed.error.kind !== "remote_error") {
+        latchedInitFailure = dialed.error;
         await transport.close();
         return dialed;
       }
@@ -172,17 +186,37 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     remote = { cdpUrl: wsUrl, browserId: newBrowserId };
     const seeded = await seedIfPinned();
     if (!seeded.success) {
+      latchedInitFailure = seeded.error;
       await transport.close();
       return seeded;
     }
     const attached = await session.attachFirstPage();
     if (!attached.success) {
+      latchedInitFailure = attached.error;
       await transport.close();
       return attached;
     }
+    latchedInitFailure = null;
     lastHealth = Date.now();
     pageCaches.clear();
     return ok(undefined);
+  };
+
+  const start = (
+    opts: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean } = {},
+  ): Promise<Result<void, CdpError>> => {
+    const isExplicit = Boolean(opts.reconnectNow ?? opts.retrySetup);
+    if (latchedInitFailure && !isExplicit) {
+      return Promise.resolve(err(latchedInitFailure));
+    }
+    if (inFlightInit) {
+      return inFlightInit;
+    }
+    const running = doStart(opts).finally(() => {
+      inFlightInit = null;
+    });
+    inFlightInit = running;
+    return running;
   };
 
   const stop = async (): Promise<void> => {
@@ -197,10 +231,16 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const reattach = async (): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const seeded = await seedIfPinned();
-    if (!seeded.success) return seeded;
+    if (!seeded.success) {
+      latchedInitFailure = seeded.error;
+      await stop();
+      return seeded;
+    }
     const reattached = await session.attachFirstPage();
     if (reattached.success) {
+      latchedInitFailure = null;
       pageCaches.clear();
       return ok(undefined);
     }
@@ -212,6 +252,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   // fails for a page-level reason (navigation in flight, a throwing page) still proves the session routes,
   // so it counts as alive; only a dead session id triggers a re-attach.
   const checkHealth = async (): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     if (transport.state() !== "open" || !session.current()) return restart();
     if (Date.now() - lastHealth < HEALTH_TTL_MS) return ok(undefined);
     const probe = await session.callBrowser("Target.getTargets", {}, { timeoutMs: 2_000 });
@@ -236,7 +277,9 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
   // Concurrent callers share one in-flight check, so two tools racing after a disconnect cannot both restart the transport.
   const ensureAlive = (): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return Promise.resolve(err(latchedInitFailure));
     if (healthCheck) return healthCheck;
+    if (inFlightInit) return inFlightInit;
     const running = checkHealth().finally(() => {
       healthCheck = null;
     });
@@ -245,6 +288,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const evaluateJs = async (expression: string, sessionId?: string): Promise<Result<unknown, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     // Wrap only when the trimmed source *starts with* `return` — matching the substring anywhere silently turned expressions mentioning it into `undefined`.
     const trimmed = expression.trim();
     const isReturnStatement = /^return[\s(]/.test(trimmed);
@@ -260,6 +304,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const readPageInfo = async (): Promise<Result<PageInfo, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const dirty = session.drainPageInfoInvalidations();
     const currentTid = session.current()?.targetId;
     const cached = currentTid ? pageCaches.get(currentTid) : undefined;
@@ -275,6 +320,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const pageInfo = async (): Promise<Result<PageInfoResult, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const d = session.takeDialog();
     if (d) return ok({ kind: "dialog", dialog: d });
     const info = await readPageInfo();
@@ -283,6 +329,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const listTabs = async (includeInternal = true): Promise<Result<ReadonlyArray<TabInfo>, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const r = await session.callBrowser("Target.getTargets");
     if (!r.success) return r;
     const tabs = r.data.targetInfos
@@ -303,6 +350,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const switchTab = async (targetId: string): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const r = await session.switchTo(targetId);
     if (!r.success) return r;
     await session.call("Runtime.evaluate", {
@@ -312,6 +360,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const newTab = async (url?: string): Promise<Result<string, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     // ensureHarnessWindow lists live targets and reconciles ownership itself, so no listing is needed here.
     const window = await ensureHarnessWindow(api);
     if (!window.success) return window;
@@ -334,6 +383,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const closeTab = async (targetId: string): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const r = await session.callBrowser("Target.closeTarget", { targetId });
     if (!r.success) return r;
     ownership.remove(targetId);
@@ -351,7 +401,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const status = (): DaemonStatus => ({
-    alive: transport.state() === "open" && session.current() !== null,
+    alive: transport.state() === "open" && session.current() !== null && latchedInitFailure === null,
     sessionId: session.current()?.sessionId ?? null,
     namespace: opts.namespace,
     ...(remote?.browserId !== undefined ? { remoteBrowserId: remote.browserId } : {}),
@@ -389,6 +439,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       profileContextId = contextId;
     },
     seedPinnedProfileWindow: async () => {
+      if (latchedInitFailure) return err(latchedInitFailure);
       if (!profilePin) {
         return err(cdpError("discovery_failed", "no browser profile is selected — run /browser-profile"));
       }

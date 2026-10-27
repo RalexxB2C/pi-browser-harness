@@ -144,22 +144,20 @@ describe("performSetup", () => {
   });
 
   for (const marker of ["DevToolsActivePort missing", "remote debugging is off", "connect ECONNREFUSED 127.0.0.1:9222", "Cannot reach Chrome DevTools"]) {
-    test(`a start failure mentioning "${marker}" is classified as the remote-debugging hint`, async () => {
+    test(`a start failure mentioning "${marker}" retains its category and message without asserting debugging is disabled`, async () => {
       const c = await setupClient({ startError: marker });
       const r = await performSetup(c.client, undefined, ready);
       assert.equal(r.success, false);
-      assert.match(r.error, /^Browser remote debugging needs to be enabled\./);
-      assert.match(r.error, /chrome:\/\/inspect\/#remote-debugging/);
-      assert.match(r.error, /--remote-debugging-port=9222/);
-      assert.match(r.error, /BU_CDP_WS/);
+      assert.equal(r.error, `Connection failed (discovery_failed): ${marker}`);
+      assert.doesNotMatch(r.error, /Browser remote debugging needs to be enabled/);
     });
   }
 
-  test("any other start failure is reported verbatim as a connection failure", async () => {
+  test("any other start failure is reported with its category and cause", async () => {
     const c = await setupClient({ startError: "daemon socket vanished" });
     const r = await performSetup(c.client, undefined, ready);
     assert.equal(r.success, false);
-    assert.equal(r.error, "Connection failed: daemon socket vanished");
+    assert.equal(r.error, "Connection failed (discovery_failed): daemon socket vanished");
   });
 
   test("a failed test navigation is reported after the client connected", async () => {
