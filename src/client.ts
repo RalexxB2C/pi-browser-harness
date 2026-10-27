@@ -11,9 +11,14 @@ import type { CdpTransport } from "./cdp/types";
 import { type CdpSession, createCdpSession } from "./cdp/session";
 import { type OwnershipRegistry, createOwnershipRegistry, reconcileOwnership } from "./cdp/ownership";
 import { ensureHarnessWindow, openHarnessTab } from "./cdp/target-factory";
-import { seedProfileWindow, type SeedDeps } from "./profile/bind";
+import { seedProfileWindow, type SeedDeps, verifyConnectedBrowserIdentity } from "./profile/bind";
 import type { ProfilePin } from "./profile/store";
 import type { DaemonStatus, DialogInfo, PageInfo, PageInfoResult, TabInfo } from "./cdp/types";
+
+export type ProfileContext =
+  | { readonly kind: "unresolved" }
+  | { readonly kind: "default" }
+  | { readonly kind: "named"; readonly contextId: string };
 
 export type BrowserClientOptions = {
   readonly namespace: string;
@@ -23,12 +28,15 @@ export type BrowserClientOptions = {
     readonly ownedTargetIds?: ReadonlyArray<string>;
     readonly harnessWindowTargetId?: string;
     readonly harnessWindowId?: number;
+    readonly profileContext?: ProfileContext;
+    readonly profileContextId?: string;
   };
   readonly profilePin?: ProfilePin | null;
   readonly onOwnershipChange?: (snapshot: {
     readonly ownedTargetIds: ReadonlyArray<string>;
     readonly harnessWindowTargetId: string | undefined;
     readonly harnessWindowId: number | undefined;
+    readonly profileContext?: ProfileContext;
   }) => void;
   readonly seedDeps?: SeedDeps;
 };
@@ -58,8 +66,11 @@ export type BrowserClient = {
   userDataDir(): string | undefined;
   profilePin(): ProfilePin | null;
   setProfilePin(pin: ProfilePin | null): void;
+  profileContext(): ProfileContext;
+  setProfileContext(context: ProfileContext): void;
   profileContextId(): string | undefined;
   setProfileContextId(contextId: string | undefined): void;
+  verifyProfileIdentity(): Promise<Result<void, CdpError>>;
   seedPinnedProfileWindow(): Promise<Result<string, CdpError>>;
   mutationMutex(): Mutex;
 };
@@ -111,15 +122,25 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     ownershipInit.harnessWindowId = opts.initialOwnership.harnessWindowId;
   }
   const ownership = createOwnershipRegistry(ownershipInit);
-  if (opts.onOwnershipChange) {
-    const cb = opts.onOwnershipChange;
-    ownership.onChange(() => {
-      cb({
+  let profileContext: ProfileContext = opts.initialOwnership?.profileContext
+    ?? (opts.initialOwnership?.profileContextId !== undefined
+      ? { kind: "named", contextId: opts.initialOwnership.profileContextId }
+      : { kind: "unresolved" });
+  let profileContextId: string | undefined = profileContext.kind === "named" ? profileContext.contextId : undefined;
+
+  const notifyOwnership = (): void => {
+    if (opts.onOwnershipChange) {
+      opts.onOwnershipChange({
         ownedTargetIds: ownership.list(),
         harnessWindowTargetId: ownership.harnessWindow(),
         harnessWindowId: ownership.harnessWindowId(),
+        profileContext,
       });
-    });
+    }
+  };
+
+  if (opts.onOwnershipChange) {
+    ownership.onChange(notifyOwnership);
   }
   const session = createCdpSession(transport, ownership, async () => {
     const window = await ensureHarnessWindow(api);
@@ -134,7 +155,6 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
   let userDataDir: string | undefined;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
-  let profileContextId: string | undefined;
 
   // With a pin set the window must exist BEFORE anything attaches, or attachFirstPage's bare Target.createTarget lands in the focus-derived default profile.
   const seedIfPinned = async (): Promise<Result<void, CdpError>> => {
@@ -181,7 +201,11 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
     const newBrowserId: string = wsUrl.split("/").pop() ?? "unknown";
     if (remote?.browserId !== newBrowserId) {
+      profileContext = { kind: "unresolved" };
       profileContextId = undefined;
+      ownership.replaceAll([]);
+      ownership.setHarnessWindow(undefined);
+      ownership.setHarnessWindowId(undefined);
     }
     remote = { cdpUrl: wsUrl, browserId: newBrowserId };
     const seeded = await seedIfPinned();
@@ -431,12 +455,33 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
         : profilePin?.userDataDir !== pin.userDataDir || profilePin.profileDir !== pin.profileDir;
       profilePin = pin;
       if (changed) {
+        profileContext = { kind: "unresolved" };
         profileContextId = undefined;
+        notifyOwnership();
       }
+    },
+    profileContext: () => profileContext,
+    setProfileContext: (ctx) => {
+      profileContext = ctx;
+      profileContextId = ctx.kind === "named" ? ctx.contextId : undefined;
+      notifyOwnership();
     },
     profileContextId: () => profileContextId,
     setProfileContextId: (contextId) => {
-      profileContextId = contextId;
+      if (contextId !== undefined) {
+        profileContext = { kind: "named", contextId };
+        profileContextId = contextId;
+      } else {
+        profileContext = { kind: "unresolved" };
+        profileContextId = undefined;
+      }
+      notifyOwnership();
+    },
+    verifyProfileIdentity: async () => {
+      if (!profilePin) return ok(undefined);
+      const verified = await verifyConnectedBrowserIdentity(api, profilePin, opts.seedDeps);
+      if (!verified.success) return verified;
+      return ok(undefined);
     },
     seedPinnedProfileWindow: async () => {
       if (latchedInitFailure) return err(latchedInitFailure);

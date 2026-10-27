@@ -164,8 +164,11 @@ export const createFakeClient = async (opts: FakeClientOptions = {}): Promise<Fa
     userDataDir: () => undefined,
     profilePin: () => null,
     setProfilePin: noop,
+    profileContext: () => ({ kind: "unresolved" }),
+    setProfileContext: noop,
     profileContextId: () => undefined,
     setProfileContextId: noop,
+    verifyProfileIdentity: () => Promise.resolve(ok(undefined)),
     seedPinnedProfileWindow: () => Promise.resolve(notConfigured("seedPinnedProfileWindow")),
     mutationMutex: () => mutex,
   };
