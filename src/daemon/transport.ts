@@ -100,14 +100,6 @@ export const createDaemonTransport = (clientId: string, socketPath: string = dae
                   }
                 : undefined;
               settle(ok(undefined));
-            } else if (msg.action === "provenance") {
-              actualEndpointInfo = (msg.browserId !== undefined || msg.userDataDir !== undefined || msg.cdpUrl !== undefined)
-                ? {
-                    ...(msg.browserId !== undefined ? { browserId: msg.browserId } : {}),
-                    ...(msg.userDataDir !== undefined ? { userDataDir: msg.userDataDir } : {}),
-                    ...(msg.cdpUrl !== undefined ? { wsUrl: msg.cdpUrl } : {}),
-                  }
-                : undefined;
             } else if (msg.action === "shutdown") {
               cleanup(sock, `Daemon shutting down: ${msg.reason ?? "unknown"}`);
               settle(err(cdpError("transport_closed", `Daemon refused the connection: ${msg.reason ?? "unknown"}`)));

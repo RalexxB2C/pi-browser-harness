@@ -26,7 +26,7 @@ export type WireEvent = {
   readonly sessionId?: string;
 };
 
-export const CONTROL_ACTIONS = ["register", "registered", "deregister", "shutdown", "provenance"] as const;
+export const CONTROL_ACTIONS = ["register", "registered", "deregister", "shutdown"] as const;
 
 export type ControlAction = (typeof CONTROL_ACTIONS)[number];
 
@@ -43,15 +43,7 @@ export type WireRegistered = {
 };
 export type WireDeregister = { readonly type: "control"; readonly action: "deregister"; readonly clientId: string };
 export type WireShutdown = { readonly type: "control"; readonly action: "shutdown"; readonly reason?: string };
-export type WireProvenance = {
-  readonly type: "control";
-  readonly action: "provenance";
-  readonly browserId?: string;
-  readonly userDataDir?: string;
-  readonly cdpUrl?: string;
-};
-
-export type WireControl = WireRegister | WireRegistered | WireDeregister | WireShutdown | WireProvenance;
+export type WireControl = WireRegister | WireRegistered | WireDeregister | WireShutdown;
 
 export type WireMessage = WireRequest | WireResponse | WireEvent | WireControl;
 
@@ -78,12 +70,6 @@ const isWireControl = (v: Record<string, unknown>): v is WireControl => {
       );
     case "shutdown":
       return isOptionalString(v["reason"]);
-    case "provenance":
-      return (
-        isOptionalString(v["browserId"]) &&
-        isOptionalString(v["userDataDir"]) &&
-        isOptionalString(v["cdpUrl"])
-      );
   }
 };
 

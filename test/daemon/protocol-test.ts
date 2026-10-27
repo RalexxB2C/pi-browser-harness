@@ -8,13 +8,12 @@ const parse = (v: unknown): WireMessage | null => deserialize(JSON.stringify(v))
 
 describe("daemon wire protocol guard", () => {
   test("every control action round-trips with exactly its own fields", () => {
-    assert.deepEqual(CONTROL_ACTIONS, ["register", "registered", "deregister", "shutdown", "provenance"]);
+    assert.deepEqual(CONTROL_ACTIONS, ["register", "registered", "deregister", "shutdown"]);
     assert.deepEqual(roundTrip({ type: "control", action: "register", clientId: "c" }), { type: "control", action: "register", clientId: "c" });
     assert.deepEqual(roundTrip({ type: "control", action: "registered", clientId: "c" }), { type: "control", action: "registered", clientId: "c" });
     assert.deepEqual(roundTrip({ type: "control", action: "deregister", clientId: "c" }), { type: "control", action: "deregister", clientId: "c" });
     assert.deepEqual(roundTrip({ type: "control", action: "shutdown" }), { type: "control", action: "shutdown" });
     assert.deepEqual(roundTrip({ type: "control", action: "shutdown", reason: "idle" }), { type: "control", action: "shutdown", reason: "idle" });
-    assert.deepEqual(roundTrip({ type: "control", action: "provenance", browserId: "b" }), { type: "control", action: "provenance", browserId: "b" });
   });
 
   test("a control message missing or mistyping its clientId is rejected", () => {
