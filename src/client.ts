@@ -265,15 +265,6 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
     userDataDir = transportUserDataDir;
 
-    const samePin = (
-      a?: { readonly userDataDir: string; readonly profileDir: string } | null,
-      b?: ProfilePin | null,
-    ): boolean => {
-      if (!a && !b) return true;
-      if (!a || !b) return false;
-      return a.userDataDir === b.userDataDir && a.profileDir === b.profileDir;
-    };
-
     if (registryProvenance !== null) {
       const browserMatches = Boolean(
         registryProvenance.browserId &&

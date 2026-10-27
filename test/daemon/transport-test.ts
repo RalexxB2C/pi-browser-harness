@@ -364,4 +364,126 @@ describe("daemon transport", { skip: SKIP }, () => {
       await daemon.dispose();
     }
   });
+
+  test("C5-1: production connection+bridge+transport integration test for superseded A->B: pending work fails safely and no old-profile spawn/reuse", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pbh-c51-"));
+    const socketPath = join(dir, "d.sock");
+    const pinA: ProfilePin = {
+      userDataDir: "/home/u/.config/browser-A",
+      profileDir: "Profile 1",
+      label: "Profile A",
+      savedAt: "",
+    };
+
+    let daemonCurrentAck: WireControl = {
+      type: "control",
+      action: "registered",
+      clientId: "client-c51",
+      browserId: "browser-A",
+      userDataDir: pinA.userDataDir,
+      cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-A",
+    };
+
+    const serverConnections: Socket[] = [];
+    const server: Server = createServer((conn) => {
+      serverConnections.push(conn);
+      conn.on("error", () => undefined);
+      const rl = createInterface({ input: conn, crlfDelay: Infinity });
+      rl.on("line", (line) => {
+        const msg = deserialize(line);
+        if (msg?.type === "control" && msg.action === "register") {
+          const ack = { ...daemonCurrentAck, clientId: msg.clientId };
+          conn.write(serialize(ack) + "\n");
+        } else if (msg?.type === "request") {
+          if (msg.method === "Target.setDiscoverTargets") {
+            conn.write(serialize({ type: "response", id: msg.id, result: {} }) + "\n");
+          } else if (msg.method === "Target.getTargets") {
+            conn.write(serialize({
+              type: "response",
+              id: msg.id,
+              result: { targetInfos: [{ targetId: "window-A", type: "page", title: "A", url: "https://a.test/" }] },
+            }) + "\n");
+          } else if (msg.method === "Target.attachToTarget") {
+            conn.write(serialize({ type: "response", id: msg.id, result: { sessionId: "s-A" } }) + "\n");
+          } else if (msg.method === "Browser.getWindowForTarget") {
+            conn.write(serialize({ type: "response", id: msg.id, result: { windowId: 7 } }) + "\n");
+          } else if (msg.method === "Target.activateTarget") {
+            conn.write(serialize({ type: "response", id: msg.id, result: {} }) + "\n");
+          } else {
+            conn.write(serialize({ type: "response", id: msg.id, result: {} }) + "\n");
+          }
+        }
+      });
+    });
+    await new Promise<void>((res) => { server.listen(socketPath, () => { res(); }); });
+
+    try {
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: pinA.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+        },
+      };
+
+      const transport = createDaemonTransport("client-c51", socketPath);
+      const client = createBrowserClient({
+        namespace: "test-c51",
+        transport,
+        profilePin: pinA,
+        seedDeps,
+        discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/browser-A" })),
+        initialOwnership: {
+          namespace: "test-c51",
+          browserId: "browser-A",
+          userDataDir: pinA.userDataDir,
+          profilePin: pinA,
+          ownedTargetIds: ["window-A"],
+          harnessWindowTargetId: "window-A",
+          profileContext: { kind: "default" },
+        },
+      });
+
+      const r1 = await client.start();
+      assert.equal(r1.success, true);
+      assert.equal(client.owns("window-A"), true);
+      assert.equal(launches.length, 0);
+
+      daemonCurrentAck = {
+        type: "control",
+        action: "registered",
+        clientId: "client-c51",
+        browserId: "browser-B",
+        userDataDir: "/home/u/.config/browser-B",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
+      };
+
+      const shutdownMsg: WireControl = { type: "control", action: "shutdown", reason: "chrome_disconnected" };
+      for (const conn of serverConnections) {
+        conn.write(serialize(shutdownMsg) + "\n");
+      }
+
+      await sleep(20);
+      assert.equal(transport.state(), "closed", "transport must close upon shutdown notification");
+
+      const r2 = await client.ensureAlive();
+      assert.equal(r2.success, false);
+      assert.match(r2.error.message, /belongs to \/home\/u\/\.config\/browser-A, but the harness is connected to \/home\/u\/\.config\/browser-B/);
+
+      assert.equal(client.owns("window-A"), false, "old-profile window must not be owned");
+      assert.equal(launches.length, 0, "no spawn allowed on mismatched connected browser");
+
+      await transport.close();
+    } finally {
+      for (const c of serverConnections) c.destroy();
+      await new Promise<void>((done) => { server.close(() => { done(); }); });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

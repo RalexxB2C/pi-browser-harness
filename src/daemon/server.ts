@@ -59,6 +59,7 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
   // Sockets that have not registered yet, by their temporary id.
   const anonymous = new Map<string, ClientSocket>();
   const clients = new Map<string, ClientSocket>();
+  const reserving = new Map<string, ClientSocket>();
   const messageHandlers = new Set<MessageHandler>();
   const connectHandlers = new Set<ConnectionHandler>();
   const disconnectHandlers = new Set<ConnectionHandler>();
@@ -75,6 +76,9 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
 
   // A registered client leaves exactly once: either its socket closes or it deregisters first.
   const forget = (client: ClientSocket): void => {
+    for (const [id, c] of reserving) {
+      if (c === client) reserving.delete(id);
+    }
     if (!client.registered) return;
     client.registered = false;
     clients.delete(client.id);
@@ -105,7 +109,7 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
             if (client.registered) return;
             const clientId = msg.clientId;
 
-            if (clients.has(clientId)) {
+            if (clients.has(clientId) || reserving.has(clientId)) {
               const reply: WireControl = {
                 type: "control",
                 action: "shutdown",
@@ -116,11 +120,37 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
               return;
             }
 
-            const finishRegistration = async () => {
-              if (options.awaitReady && !options.provenance?.()) {
-                await options.awaitReady(5_000);
+            reserving.set(clientId, client);
+
+            // Separate daemon IPC liveness from Chrome readiness:
+            // Liveness probes need only test that the daemon is listening; they must not block on Chrome
+            if (clientId.startsWith("_liveness_probe")) {
+              reserving.delete(clientId);
+              anonymous.delete(tempId);
+              client.id = clientId;
+              client.registered = true;
+              clients.set(clientId, client);
+
+              const ack: WireControl = { type: "control", action: "registered", clientId };
+              socket.write(serialize(ack) + "\n");
+
+              for (const h of connectHandlers) h(client);
+              return;
+            }
+
+            const finishRegistration = async (): Promise<void> => {
+              try {
+                if (options.awaitReady && !options.provenance?.()) {
+                  await options.awaitReady(5_000);
+                }
+              } catch {
+                // Readiness timeout or failure must not crash server
               }
-              if (socket.destroyed) return;
+              if (socket.destroyed || reserving.get(clientId) !== client) {
+                reserving.delete(clientId);
+                return;
+              }
+              reserving.delete(clientId);
               anonymous.delete(tempId);
               client.id = clientId;
               client.registered = true;

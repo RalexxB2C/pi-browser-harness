@@ -624,4 +624,3 @@ describe("tool wrapper presentation under initialization failure", () => {
     }
   });
 });
-

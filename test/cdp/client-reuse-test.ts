@@ -390,7 +390,6 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       transport: stub.transport,
       remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
-      // Fresh client with no prior ownership
       initialOwnership: { namespace: "test-context-absence", ownedTargetIds: [] },
       seedDeps,
     });
@@ -436,7 +435,6 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     assert.equal(client.owns("hw-work"), true);
     assert.equal(client.ownership().harnessWindow(), "hw-work");
 
-    // Changing pin to Default clears ownership
     client.setProfilePin(defaultPin);
     assert.equal(client.owns("hw-work"), false, "ownership must be cleared on pin change");
     assert.equal(client.ownership().harnessWindow(), undefined, "harness window must be cleared on pin change");

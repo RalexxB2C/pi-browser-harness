@@ -206,7 +206,7 @@ export const createCdpBridge = (options: ChromeConnectionDependencies = {}): Cdp
       // Requests that went out on this socket can never be answered now; fail them at once
       // rather than leaving them to the command timeout.
       failAll(mux.takeWhere((e) => e.generation === generation), "Chrome disconnected");
-      if (reason === "dropped") closeHandler?.();
+      if (reason === "dropped" || reason === "superseded") closeHandler?.();
     },
   });
 
