@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { type BrowserClient, type BrowserClientOptions, createBrowserClient } from "./client";
+import { type BrowserClient, type BrowserClientOptions, type ProfileContext, createBrowserClient } from "./client";
 import { getBrowserSystemPrompt } from "./prompt";
 import { registerSetupCommand } from "./setup";
 import { registerProfileCommand } from "./profile/command";
@@ -146,10 +146,16 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
     if (!client) {
       const transport = createTransport(restored.namespace);
 
-      const initialOwnership: { ownedTargetIds?: ReadonlyArray<string>; harnessWindowTargetId?: string; harnessWindowId?: number } = {};
+      const initialOwnership: {
+        ownedTargetIds?: ReadonlyArray<string>;
+        harnessWindowTargetId?: string;
+        harnessWindowId?: number;
+        profileContext?: ProfileContext;
+      } = {};
       if (restored.ownedTargetIds !== undefined) initialOwnership.ownedTargetIds = restored.ownedTargetIds;
       if (restored.harnessWindowTargetId !== undefined) initialOwnership.harnessWindowTargetId = restored.harnessWindowTargetId;
       if (restored.harnessWindowId !== undefined) initialOwnership.harnessWindowId = restored.harnessWindowId;
+      if (restored.profileContext !== undefined) initialOwnership.profileContext = restored.profileContext;
 
       client = createClient({
         namespace: restored.namespace,
@@ -165,6 +171,9 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
               : {}),
             ...(snap.harnessWindowId !== undefined
               ? { harnessWindowId: snap.harnessWindowId }
+              : {}),
+            ...(snap.profileContext !== undefined
+              ? { profileContext: snap.profileContext }
               : {}),
           };
           try {

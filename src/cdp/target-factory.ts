@@ -112,30 +112,75 @@ const ensureHarnessWindowUncoordinated = async (
 
   const ownership = client.ownership();
   reconcileOwnership(ownership, live);
-  const pinnedCtx = client.profileContextId();
-  // With a pin set but no context resolved yet, a recorded tab's profile cannot be verified, so seed a new window rather than risk adopting one from the wrong profile.
-  const canReuse = client.profilePin() === null || pinnedCtx !== undefined;
-  const inPinnedProfile = (targetId: string): boolean => {
-    if (!pinnedCtx) return true;
-    const info = targets.data.find((t) => t.targetId === targetId);
-    return info?.browserContextId === pinnedCtx;
-  };
+  const pin = client.profilePin();
 
-  if (canReuse) {
+  if (!pin) {
     const harnessWindow = ownership.harnessWindow();
-    if (harnessWindow && live.has(harnessWindow) && inPinnedProfile(harnessWindow)) {
+    if (harnessWindow && live.has(harnessWindow)) {
       return ok({ targetId: harnessWindow, freshlyCreated: false });
     }
-    const survivor = ownership.list().find((id) => live.has(id) && inPinnedProfile(id));
+    const survivor = ownership.list().find((id) => live.has(id));
     if (survivor) {
       ownership.setHarnessWindow(survivor);
       return ok({ targetId: survivor, freshlyCreated: false });
     }
+    const seeded = await createDedicatedWindow(client);
+    if (!seeded.success) return seeded;
+    return ok({ targetId: seeded.data, freshlyCreated: true });
   }
 
-  const seeded = client.profilePin()
-    ? await client.seedPinnedProfileWindow()
-    : await createDedicatedWindow(client);
+  // Pinned profile: reuse is gated by the verified browser identity contract
+  const idVerified = await client.verifyProfileIdentity();
+  if (!idVerified.success) {
+    return idVerified;
+  }
+
+  const harnessWindow = ownership.harnessWindow();
+  const ownedLive = harnessWindow && live.has(harnessWindow)
+    ? harnessWindow
+    : ownership.list().find((id) => live.has(id));
+
+  const profileCtx = client.profileContext();
+
+  const isEligibleTarget = (targetId: string): boolean => {
+    // Zero foreign-tab adoption: only targets explicitly in ownership are eligible
+    if (!ownership.has(targetId) && harnessWindow !== targetId) return false;
+    const info = targets.data.find((t) => t.targetId === targetId);
+    if (!info) return false;
+
+    // Distinguish unresolved profile identity from successfully resolved default context.
+    // Context absence alone does not establish profile membership!
+    if (profileCtx.kind === "named") {
+      return info.browserContextId === profileCtx.contextId;
+    }
+    if (profileCtx.kind === "default") {
+      return info.browserContextId === undefined;
+    }
+    // If profile identity is unresolved:
+    // With eligible persisted ownership from this namespace/profile,
+    // the target must match the expected profile directory / context.
+    // If pin profileDir is not "Default" and target has no browserContextId,
+    // a non-default profile without browserContextId cannot be assumed from context absence alone.
+    if (pin.profileDir !== "Default" && info.browserContextId === undefined) {
+      return false;
+    }
+    return true;
+  };
+
+  if (ownedLive && isEligibleTarget(ownedLive)) {
+    const info = targets.data.find((t) => t.targetId === ownedLive);
+    if (profileCtx.kind === "unresolved") {
+      if (info?.browserContextId) {
+        client.setProfileContext({ kind: "named", contextId: info.browserContextId });
+      } else {
+        client.setProfileContext({ kind: "default" });
+      }
+    }
+    ownership.setHarnessWindow(ownedLive);
+    return ok({ targetId: ownedLive, freshlyCreated: false });
+  }
+
+  const seeded = await client.seedPinnedProfileWindow();
   if (!seeded.success) return seeded;
   return ok({ targetId: seeded.data, freshlyCreated: true });
 };

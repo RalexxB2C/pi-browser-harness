@@ -38,18 +38,13 @@ const manualFallbackHint = (pin: ProfilePin): string =>
   `open a window for "${pin.label}" yourself (browser profile menu → ${pin.profileDir}), then retry. ` +
   `Run /browser-profile to pick a different profile, or clear the selection to use whichever window is focused.`;
 
-export const seedProfileWindow = async (
+export const verifyConnectedBrowserIdentity = async (
   client: BrowserClient,
   pin: ProfilePin,
   deps: SeedDeps = {},
-): Promise<Result<string, CdpError>> => {
+): Promise<Result<{ exePath: string; running: RunningBrowser }, CdpError>> => {
   const detect = deps.detectRunningBrowser ?? detectRunningBrowser;
   const resolveExe = deps.resolveBrowserExecutable ?? resolveBrowserExecutable;
-  const launch = deps.openProfileWindow ?? openProfileWindow;
-  const sleep = deps.sleep ?? sleepMs;
-  const now = deps.now ?? Date.now;
-  const deadlineMs = deps.deadlineMs ?? SEED_DEADLINE_MS;
-  const pollMs = deps.pollMs ?? SEED_POLL_MS;
 
   const connectedDir = client.userDataDir();
   if (connectedDir && connectedDir !== pin.userDataDir) {
@@ -90,6 +85,24 @@ export const seedProfileWindow = async (
     ));
   }
 
+  return ok({ exePath, running });
+};
+
+export const seedProfileWindow = async (
+  client: BrowserClient,
+  pin: ProfilePin,
+  deps: SeedDeps = {},
+): Promise<Result<string, CdpError>> => {
+  const launch = deps.openProfileWindow ?? openProfileWindow;
+  const sleep = deps.sleep ?? sleepMs;
+  const now = deps.now ?? Date.now;
+  const deadlineMs = deps.deadlineMs ?? SEED_DEADLINE_MS;
+  const pollMs = deps.pollMs ?? SEED_POLL_MS;
+
+  const verified = await verifyConnectedBrowserIdentity(client, pin, deps);
+  if (!verified.success) return verified;
+  const { exePath, running } = verified.data;
+
   const launched = await launch({
     exePath,
     profileDir: pin.profileDir,
@@ -118,7 +131,12 @@ export const seedProfileWindow = async (
   }
 
   // The sentinel's context is the profile's context — the only way to learn it.
-  if (seed.browserContextId) client.setProfileContextId(seed.browserContextId);
+  if (seed.browserContextId) {
+    client.setProfileContext({ kind: "named", contextId: seed.browserContextId });
+    client.setProfileContextId(seed.browserContextId);
+  } else {
+    client.setProfileContext({ kind: "default" });
+  }
 
   const ownership = client.ownership();
   ownership.setHarnessWindow(seed.targetId);

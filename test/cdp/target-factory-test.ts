@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { ensureHarnessWindow, openHarnessTab } from "../../src/cdp/target-factory";
 import { createCdpSession } from "../../src/cdp/session";
 import { cdpError, type CdpError } from "../../src/cdp/errors";
-import type { BrowserClient } from "../../src/client";
+import type { BrowserClient, ProfileContext } from "../../src/client";
 import type { CdpTransport } from "../../src/cdp/types";
 import type { ProfilePin } from "../../src/profile/store";
 import { type Result, err, ok } from "../../src/util/result";
@@ -35,8 +35,10 @@ const pin: ProfilePin = { userDataDir: "/udd", profileDir: "Profile 1", label: "
 
 type ClientOverrides = {
   readonly profilePin?: ProfilePin | null;
+  readonly profileContext?: ProfileContext;
   readonly profileContextId?: string;
   readonly seed?: () => Promise<Result<string, CdpError>>;
+  readonly verifyIdentity?: () => Promise<Result<void, CdpError>>;
 };
 
 type Harness = {
@@ -54,10 +56,21 @@ const harness = async (
 ): Promise<Harness> => {
   const fake = await createFakeClient({ canned, ownedTargetIds });
   let seeds = 0;
+  let currentProfileContext: ProfileContext = overrides.profileContext
+    ?? (overrides.profileContextId !== undefined
+      ? { kind: "named", contextId: overrides.profileContextId }
+      : { kind: "unresolved" });
+
   const client: BrowserClient = {
     ...fake.client,
     profilePin: () => overrides.profilePin ?? null,
-    profileContextId: () => overrides.profileContextId,
+    profileContext: () => currentProfileContext,
+    setProfileContext: (ctx) => { currentProfileContext = ctx; },
+    profileContextId: () => (currentProfileContext.kind === "named" ? currentProfileContext.contextId : undefined),
+    setProfileContextId: (id) => {
+      currentProfileContext = id !== undefined ? { kind: "named", contextId: id } : { kind: "unresolved" };
+    },
+    verifyProfileIdentity: () => (overrides.verifyIdentity ? overrides.verifyIdentity() : Promise.resolve(ok(undefined))),
     seedPinnedProfileWindow: () => {
       seeds++;
       const seed = overrides.seed;
@@ -189,6 +202,65 @@ describe("ensureHarnessWindow", () => {
     const r = await ensureHarnessWindow(h.client);
     assert.deepEqual(r, ok({ targetId: "seeded", freshlyCreated: true }));
     assert.equal(h.seedCalls(), 1);
+  });
+
+  test("with a pin and a resolved default context (no browserContextId), a harness window in the default context is reused", async () => {
+    const defaultPin: ProfilePin = { userDataDir: "/udd", profileDir: "Default", label: "Default", savedAt: "" };
+    const h = await harness(targets({ targetId: "t1" }, { targetId: "hw" }), {
+      profilePin: defaultPin,
+      profileContext: { kind: "default" },
+    });
+    h.fake.ownership.add("hw");
+    h.fake.ownership.setHarnessWindow("hw");
+    const r = await ensureHarnessWindow(h.client);
+    assert.deepEqual(r, ok({ targetId: "hw", freshlyCreated: false }));
+    assert.equal(h.seedCalls(), 0);
+  });
+
+  test("with a pin and a resolved default context, a harness window in a named context is rejected and seeds", async () => {
+    const defaultPin: ProfilePin = { userDataDir: "/udd", profileDir: "Default", label: "Default", savedAt: "" };
+    const h = await harness(targets({ targetId: "t1" }, { targetId: "hw", browserContextId: "ctx-other" }), {
+      profilePin: defaultPin,
+      profileContext: { kind: "default" },
+      seed: () => Promise.resolve(ok("seeded")),
+    });
+    h.fake.ownership.add("hw");
+    h.fake.ownership.setHarnessWindow("hw");
+    const r = await ensureHarnessWindow(h.client);
+    assert.deepEqual(r, ok({ targetId: "seeded", freshlyCreated: true }));
+    assert.equal(h.seedCalls(), 1);
+  });
+
+  test("with a pin, an unowned stranger tab in the default context is never adopted", async () => {
+    const defaultPin: ProfilePin = { userDataDir: "/udd", profileDir: "Default", label: "Default", savedAt: "" };
+    const h = await harness(
+      { ...targets({ targetId: "stranger" }), "Target.createTarget": ok({ targetId: "boot" }) },
+      {
+        profilePin: defaultPin,
+        profileContext: { kind: "default" },
+        seed: () => Promise.resolve(ok("seeded")),
+      },
+      [],
+    );
+    const r = await ensureHarnessWindow(h.client);
+    assert.deepEqual(r, ok({ targetId: "seeded", freshlyCreated: true }));
+    assert.equal(h.seedCalls(), 1);
+    assert.equal(h.fake.ownership.has("stranger"), false);
+  });
+
+  test("reuse is gated by identity verification: verification failure rejects reuse without launch", async () => {
+    const h = await harness(targets({ targetId: "t1" }, { targetId: "hw", browserContextId: "ctx-pinned" }), {
+      profilePin: pin,
+      profileContextId: "ctx-pinned",
+      verifyIdentity: () => Promise.resolve(err(cdpError("discovery_failed", "ambiguous browser candidates"))),
+    });
+    h.fake.ownership.add("hw");
+    h.fake.ownership.setHarnessWindow("hw");
+    const r = await ensureHarnessWindow(h.client);
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /ambiguous browser candidates/);
+    assert.equal(h.seedCalls(), 0, "must produce zero launches on verification failure");
   });
 
   test("a seed failure is propagated", async () => {

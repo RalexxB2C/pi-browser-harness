@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ProfileContext } from "./client";
 import { asArrayOf, asNumber, asString, isRecord } from "./util/guards";
 
 export type BrowserState = {
@@ -6,6 +7,7 @@ export type BrowserState = {
   readonly ownedTargetIds?: ReadonlyArray<string>;
   readonly harnessWindowTargetId?: string;
   readonly harnessWindowId?: number;
+  readonly profileContext?: ProfileContext;
 };
 
 export const defaultState = (namespace = "default"): BrowserState => ({
@@ -22,6 +24,7 @@ const stateKey = (state: BrowserState): string =>
     ownedTargetIds: [...(state.ownedTargetIds ?? [])].sort(),
     harnessWindowTargetId: state.harnessWindowTargetId ?? null,
     harnessWindowId: state.harnessWindowId ?? null,
+    profileContext: state.profileContext ?? null,
   });
 
 export type StatePersister = {
@@ -54,11 +57,24 @@ const asPersistedState = (v: unknown): Partial<BrowserState> | undefined => {
   const ownedTargetIds = asArrayOf(v["ownedTargetIds"], asString);
   const harnessWindowTargetId = asString(v["harnessWindowTargetId"]);
   const harnessWindowId = asNumber(v["harnessWindowId"]);
+  let profileContext: ProfileContext | undefined;
+  if (isRecord(v["profileContext"])) {
+    const kind = asString(v["profileContext"]["kind"]);
+    if (kind === "default" || kind === "unresolved") {
+      profileContext = { kind };
+    } else if (kind === "named") {
+      const contextId = asString(v["profileContext"]["contextId"]);
+      if (contextId !== undefined) {
+        profileContext = { kind: "named", contextId };
+      }
+    }
+  }
   return {
     ...(namespace !== undefined ? { namespace } : {}),
     ...(ownedTargetIds !== undefined ? { ownedTargetIds } : {}),
     ...(harnessWindowTargetId !== undefined ? { harnessWindowTargetId } : {}),
     ...(harnessWindowId !== undefined ? { harnessWindowId } : {}),
+    ...(profileContext !== undefined ? { profileContext } : {}),
   };
 };
 
