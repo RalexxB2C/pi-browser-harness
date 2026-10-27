@@ -19,6 +19,7 @@ type MockTransportOptions = {
   connectResult?: () => Promise<Result<void, CdpError>>;
   state?: () => "open" | "closed" | "connecting";
   requestResult?: (method: string, params: Record<string, unknown>) => Promise<Result<unknown, CdpError> | undefined>;
+  actualEndpoint?: () => { readonly wsUrl?: string; readonly browserId?: string; readonly userDataDir?: string } | undefined;
 };
 
 const createMockTransport = (opts: MockTransportOptions = {}): {
@@ -71,6 +72,7 @@ const createMockTransport = (opts: MockTransportOptions = {}): {
     }),
     state: () => currentState,
     onClose: () => () => undefined,
+    ...(opts.actualEndpoint ? { actualEndpoint: opts.actualEndpoint } : {}),
   };
 
   return {
@@ -277,6 +279,11 @@ describe("BrowserClient initialization failure latching & recovery", () => {
     const sentinelUrl = "file:///tmp/pi-sentinel.html";
 
     const mock = createMockTransport({
+      actualEndpoint: () => ({
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+        browserId: "abc",
+        userDataDir: pin.userDataDir,
+      }),
       requestResult: (method) => {
         if (method === "Target.getTargets") {
           return Promise.resolve(ok({

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createDaemonTransport } from "../../src/daemon/transport";
-import { deserialize, serialize, type WireControl } from "../../src/daemon/protocol";
+import { DAEMON_RECONNECT_METHOD, deserialize, serialize, type WireControl, type WireRequest } from "../../src/daemon/protocol";
 import { createBrowserClient } from "../../src/client";
 import type { ProfilePin } from "../../src/profile/store";
 import type { SeedDeps } from "../../src/profile/bind";
@@ -29,6 +29,7 @@ const startFakeDaemon = (
     const ack: WireControl = { type: "control", action: "registered", clientId };
     conn.write(serialize(ack) + "\n");
   },
+  onRequest?: (conn: Socket, msg: WireRequest) => void,
 ): Promise<FakeDaemon> =>
   new Promise((resolve) => {
     const dir = mkdtempSync(join(tmpdir(), "pbh-transport-"));
@@ -44,6 +45,8 @@ const startFakeDaemon = (
         if (msg?.type === "control" && msg.action === "register") {
           registers.push(msg.clientId);
           onRegister(conn, msg.clientId);
+        } else if (msg?.type === "request" && onRequest) {
+          onRequest(conn, msg);
         }
       });
     });
@@ -230,6 +233,131 @@ describe("daemon transport", { skip: SKIP }, () => {
       assert.equal(startRes.error.kind, "discovery_failed");
       assert.match(startRes.error.message, /no verified user-data-dir endpoint linkage/i);
       assert.equal(launches.length, 0, "legacy daemon with unknown provenance must fail closed before spawn");
+
+      await transport.close();
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("Q2: arbitrary CDP command responses cannot alter or forge transport provenance", async () => {
+    const daemon = await startFakeDaemon(
+      (conn, clientId) => {
+        const ack: WireControl = {
+          type: "control",
+          action: "registered",
+          clientId,
+          browserId: "b-daemon-real",
+          userDataDir: "/home/u/.config/real-chrome",
+          cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-real",
+        };
+        conn.write(serialize(ack) + "\n");
+      },
+      (conn, req) => {
+        // Return a response that maliciously contains provenance fields
+        conn.write(serialize({
+          type: "response",
+          id: req.id,
+          result: {
+            browserId: "forged-browser",
+            userDataDir: "/forged/dir",
+            cdpUrl: "ws://forged",
+          },
+        }) + "\n");
+      },
+    );
+
+    try {
+      const transport = createDaemonTransport("client-forgery", daemon.socketPath);
+      await transport.connect("");
+
+      // Send arbitrary CDP command
+      const res = await transport.request("Runtime.evaluate", { expression: "1" });
+      assert.equal(res.success, true);
+
+      // Provenance MUST NOT be altered by arbitrary CDP response
+      assert.deepEqual(transport.actualEndpoint?.(), {
+        browserId: "b-daemon-real",
+        userDataDir: "/home/u/.config/real-chrome",
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-real",
+      });
+
+      await transport.close();
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("Q2: control response missing evidence clears existing actualEndpoint", async () => {
+    const daemon = await startFakeDaemon(
+      (conn, clientId) => {
+        const ack: WireControl = {
+          type: "control",
+          action: "registered",
+          clientId,
+          browserId: "b-initial",
+          userDataDir: "/home/u/.config/initial",
+          cdpUrl: "ws://127.0.0.1:9222/initial",
+        };
+        conn.write(serialize(ack) + "\n");
+      },
+      (conn, req) => {
+        if (req.method === DAEMON_RECONNECT_METHOD) {
+          // Reconnect response missing provenance fields
+          conn.write(serialize({
+            type: "response",
+            id: req.id,
+            result: { connected: true },
+          }) + "\n");
+        }
+      },
+    );
+
+    try {
+      const transport = createDaemonTransport("client-clear", daemon.socketPath);
+      await transport.connect("");
+      assert.ok(transport.actualEndpoint?.());
+
+      // Send Daemon.reconnect
+      const res = await transport.request(DAEMON_RECONNECT_METHOD, {});
+      assert.equal(res.success, true);
+
+      // Provenance snapshot MUST be cleared when control response lacks evidence
+      assert.equal(transport.actualEndpoint?.(), undefined);
+
+      await transport.close();
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("Q3: cold registration readiness: server awaits Chrome readiness so cold start receives verified provenance", async () => {
+    const daemon = await startFakeDaemon((conn, clientId) => {
+      // Simulate Chrome dialing/readiness settling with a short delay
+      setTimeout(() => {
+        const ack: WireControl = {
+          type: "control",
+          action: "registered",
+          clientId,
+          browserId: "b-cold-ready",
+          userDataDir: "/home/u/.config/cold-chrome",
+          cdpUrl: "ws://127.0.0.1:9222/cold",
+        };
+        conn.write(serialize(ack) + "\n");
+      }, 30);
+    });
+
+    try {
+      const transport = createDaemonTransport("client-cold", daemon.socketPath);
+      // Ordinary connect without reconnectNow
+      const r = await transport.connect("", { timeoutMs: 2_000 });
+      assert.equal(r.success, true);
+
+      assert.deepEqual(transport.actualEndpoint?.(), {
+        browserId: "b-cold-ready",
+        userDataDir: "/home/u/.config/cold-chrome",
+        wsUrl: "ws://127.0.0.1:9222/cold",
+      });
 
       await transport.close();
     } finally {

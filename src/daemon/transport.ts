@@ -8,6 +8,7 @@ import { DEFAULT_TIMEOUT_MS, type CdpTransport } from "../cdp/types";
 import type { CdpEvent } from "../cdp/types";
 import { type Pending, makeEventQueue, makeOnClose, rejectAllPending, sendWithTimeout } from "./queue";
 import {
+  DAEMON_RECONNECT_METHOD,
   daemonSocketPath,
   type WireRequest,
   type WireControl,
@@ -99,6 +100,14 @@ export const createDaemonTransport = (clientId: string, socketPath: string = dae
                   }
                 : undefined;
               settle(ok(undefined));
+            } else if (msg.action === "provenance") {
+              actualEndpointInfo = (msg.browserId !== undefined || msg.userDataDir !== undefined || msg.cdpUrl !== undefined)
+                ? {
+                    ...(msg.browserId !== undefined ? { browserId: msg.browserId } : {}),
+                    ...(msg.userDataDir !== undefined ? { userDataDir: msg.userDataDir } : {}),
+                    ...(msg.cdpUrl !== undefined ? { wsUrl: msg.cdpUrl } : {}),
+                  }
+                : undefined;
             } else if (msg.action === "shutdown") {
               cleanup(sock, `Daemon shutting down: ${msg.reason ?? "unknown"}`);
               settle(err(cdpError("transport_closed", `Daemon refused the connection: ${msg.reason ?? "unknown"}`)));
@@ -117,17 +126,21 @@ export const createDaemonTransport = (clientId: string, socketPath: string = dae
             if (msg.error) {
               p.resolve(err(cdpError(classifyRemoteError(msg.error.message), msg.error.message, p.method)));
             } else {
-              if (isRecord(msg.result)) {
-                const res = msg.result;
-                const bId = typeof res["browserId"] === "string" ? res["browserId"] : undefined;
-                const uDir = typeof res["userDataDir"] === "string" ? res["userDataDir"] : undefined;
-                const cUrl = typeof res["cdpUrl"] === "string" ? res["cdpUrl"] : undefined;
-                if (bId !== undefined || uDir !== undefined || cUrl !== undefined) {
-                  actualEndpointInfo = {
-                    ...(bId !== undefined ? { browserId: bId } : {}),
-                    ...(uDir !== undefined ? { userDataDir: uDir } : {}),
-                    ...(cUrl !== undefined ? { wsUrl: cUrl } : {}),
-                  };
+              if (p.method === DAEMON_RECONNECT_METHOD) {
+                if (isRecord(msg.result)) {
+                  const res = msg.result;
+                  const bId = typeof res["browserId"] === "string" ? res["browserId"] : undefined;
+                  const uDir = typeof res["userDataDir"] === "string" ? res["userDataDir"] : undefined;
+                  const cUrl = typeof res["cdpUrl"] === "string" ? res["cdpUrl"] : undefined;
+                  actualEndpointInfo = (bId !== undefined || uDir !== undefined || cUrl !== undefined)
+                    ? {
+                        ...(bId !== undefined ? { browserId: bId } : {}),
+                        ...(uDir !== undefined ? { userDataDir: uDir } : {}),
+                        ...(cUrl !== undefined ? { wsUrl: cUrl } : {}),
+                      }
+                    : undefined;
+                } else {
+                  actualEndpointInfo = undefined;
                 }
               }
               p.resolve(ok(msg.result));

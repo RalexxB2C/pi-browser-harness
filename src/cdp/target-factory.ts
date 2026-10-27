@@ -112,6 +112,11 @@ const ensureHarnessWindowUncoordinated = async (
     if (!idVerified.success) {
       return idVerified;
     }
+    const currentPin = client.profilePin();
+    const pinMatches = currentPin !== null && currentPin.profileDir === pin.profileDir && currentPin.userDataDir === pin.userDataDir;
+    if (!pinMatches) {
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
   }
 
   const targets = await listPageTargets(client);

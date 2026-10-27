@@ -34,8 +34,9 @@ const pageTargets = async (client: BrowserClient): Promise<ReadonlyArray<PageTar
   );
 };
 
-export const legacyDaemonHint = (): string =>
-  "the running browser daemon is using an older version without transport provenance. Restart the daemon with /browser-reload-daemon or restart pi to update.";
+export const unlinkedEndpointHint = (pin: ProfilePin): string =>
+  `the connected browser endpoint cannot be proven to belong to ${pin.userDataDir}. ` +
+  `Ensure your browser is open with remote debugging enabled for "${pin.label}", then run /browser-setup to reconnect, or run /browser-profile to choose a profile from the connected browser.`;
 
 const manualFallbackHint = (pin: ProfilePin): string =>
   `open a window for "${pin.label}" yourself (browser profile menu → ${pin.profileDir}), then retry. ` +
@@ -53,7 +54,7 @@ export const verifyConnectedBrowserIdentity = async (
   if (!connectedDir) {
     return err(cdpError(
       "discovery_failed",
-      `could not verify connected browser identity for "${pin.label}": connected browser has no verified user-data-dir endpoint linkage — ${legacyDaemonHint()}`,
+      `could not verify connected browser identity for "${pin.label}": connected browser has no verified user-data-dir endpoint linkage — ${unlinkedEndpointHint(pin)}`,
     ));
   }
   if (connectedDir !== pin.userDataDir) {
@@ -101,6 +102,7 @@ export const seedProfileWindow = async (
   client: BrowserClient,
   pin: ProfilePin,
   deps: SeedDeps = {},
+  isCurrent?: () => boolean,
 ): Promise<Result<string, CdpError>> => {
   const launch = deps.openProfileWindow ?? openProfileWindow;
   const sleep = deps.sleep ?? sleepMs;
@@ -108,8 +110,27 @@ export const seedProfileWindow = async (
   const deadlineMs = deps.deadlineMs ?? SEED_DEADLINE_MS;
   const pollMs = deps.pollMs ?? SEED_POLL_MS;
 
+  const checkPinValid = (): Result<void, CdpError> => {
+    if (isCurrent && !isCurrent()) {
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+    const current = client.profilePin();
+    const pinChanged = current !== null && (current.profileDir !== pin.profileDir || current.userDataDir !== pin.userDataDir);
+    if (pinChanged) {
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+    return ok(undefined);
+  };
+
+  const initialCheck = checkPinValid();
+  if (!initialCheck.success) return initialCheck;
+
   const verified = await verifyConnectedBrowserIdentity(client, pin, deps);
   if (!verified.success) return verified;
+
+  const preLaunchCheck = checkPinValid();
+  if (!preLaunchCheck.success) return preLaunchCheck;
+
   const { exePath, running } = verified.data;
 
   const launched = await launch({
@@ -126,13 +147,19 @@ export const seedProfileWindow = async (
   const deadline = now() + deadlineMs;
   let seed: PageTarget | undefined;
   while (now() < deadline && !seed) {
-    const current = client.profilePin();
-    if (current !== null && (current.profileDir !== pin.profileDir || current.userDataDir !== pin.userDataDir)) {
+    const preSleepCheck = checkPinValid();
+    if (!preSleepCheck.success) {
       kill();
       await cleanup();
-      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+      return preSleepCheck;
     }
     await sleep(pollMs);
+    const postSleepCheck = checkPinValid();
+    if (!postSleepCheck.success) {
+      kill();
+      await cleanup();
+      return postSleepCheck;
+    }
     seed = (await pageTargets(client)).find((t) => t.url === sentinelUrl);
   }
 
@@ -143,6 +170,13 @@ export const seedProfileWindow = async (
       "timeout",
       `couldn't open a window in "${pin.label}" automatically — ${manualFallbackHint(pin)}`,
     ));
+  }
+
+  const preMutationCheck = checkPinValid();
+  if (!preMutationCheck.success) {
+    kill();
+    await cleanup();
+    return preMutationCheck;
   }
 
   // The sentinel's context is the profile's context — the only way to learn it.

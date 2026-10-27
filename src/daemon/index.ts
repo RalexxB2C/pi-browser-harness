@@ -31,6 +31,7 @@ export const createDaemon = (deps: DaemonDeps = {}): Daemon => {
   const cdpBridge = deps.cdpBridge ?? createCdpBridge();
   const ipcServer = deps.ipcServer ?? createIpcServer({
     provenance: () => cdpBridge.provenance(),
+    awaitReady: () => cdpBridge.awaitReady(),
   });
   const idleTimeoutMs = deps.idleTimeoutMs ?? DAEMON_IDLE_TIMEOUT_MS;
   const exit = deps.exit ?? ((code: number): void => { process.exit(code); });

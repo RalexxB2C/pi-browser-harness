@@ -18,7 +18,7 @@ import type { ProfileWindowRequest } from "../../src/profile/launch";
 import type { SeedDeps } from "../../src/profile/bind";
 import { ok } from "../../src/util/result";
 import { createDaemonTransport } from "../../src/daemon/transport";
-import { deserialize, serialize, type WireControl, type WireRequest } from "../../src/daemon/protocol";
+import { DAEMON_RECONNECT_METHOD, deserialize, serialize, type WireControl, type WireRequest } from "../../src/daemon/protocol";
 
 // test/domains/extension-registration-test.ts covers the third-party tool seam and that contributed
 // tools reach pi on session_start. This file covers the extension's own wiring: flags, commands,
@@ -341,7 +341,18 @@ describe("createExtension wiring", () => {
         conn.write(serialize(ack) + "\n");
       },
       (conn, req) => {
-        if (req.method === "Target.getTargets") {
+        if (req.method === DAEMON_RECONNECT_METHOD) {
+          conn.write(serialize({
+            type: "response",
+            id: req.id,
+            result: {
+              connected: true,
+              browserId: "b-daemon-entry",
+              userDataDir: PIN.userDataDir,
+              cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-entry",
+            },
+          }) + "\n");
+        } else if (req.method === "Target.getTargets") {
           conn.write(serialize({
             type: "response",
             id: req.id,
@@ -470,17 +481,35 @@ describe("createExtension wiring", () => {
 
   test("real createDaemonTransport in createExtension: daemon connected to B while discovery found A fails closed before spawn", { skip: SKIP_SOCKET }, async () => {
     const extPin: ProfilePin = { userDataDir: "/home/u/.config/browser-A", profileDir: "Default", label: "Profile A", savedAt: "" };
-    const daemon = await createIsolatedDaemon((conn, clientId) => {
-      const ack: WireControl = {
-        type: "control",
-        action: "registered",
-        clientId,
-        browserId: "browser-B",
-        userDataDir: "/home/u/.config/browser-B",
-        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
-      };
-      conn.write(serialize(ack) + "\n");
-    });
+    const daemon = await createIsolatedDaemon(
+      (conn, clientId) => {
+        const ack: WireControl = {
+          type: "control",
+          action: "registered",
+          clientId,
+          browserId: "browser-B",
+          userDataDir: "/home/u/.config/browser-B",
+          cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
+        };
+        conn.write(serialize(ack) + "\n");
+      },
+      (conn, req) => {
+        if (req.method === DAEMON_RECONNECT_METHOD) {
+          conn.write(serialize({
+            type: "response",
+            id: req.id,
+            result: {
+              connected: true,
+              browserId: "browser-B",
+              userDataDir: "/home/u/.config/browser-B",
+              cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
+            },
+          }) + "\n");
+        } else {
+          conn.write(serialize({ type: "response", id: req.id, result: {} }) + "\n");
+        }
+      },
+    );
 
     try {
       const launches: ProfileWindowRequest[] = [];

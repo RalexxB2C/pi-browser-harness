@@ -1,6 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { seedProfileWindow, legacyDaemonHint, type SeedDeps } from "../../src/profile/bind";
+import { seedProfileWindow, unlinkedEndpointHint, type SeedDeps } from "../../src/profile/bind";
 import type { BrowserClient } from "../../src/client";
 import type { ProfilePin } from "../../src/profile/store";
 import {
@@ -61,6 +61,7 @@ const seeded = async (opts: {
   const client: BrowserClient = {
     ...fake.client,
     userDataDir: () => "userDataDir" in opts ? opts.userDataDir : pin.userDataDir,
+    profilePin: () => pin,
     setProfileContextId: (id) => { contexts.push(id); },
   };
   const launches: ProfileWindowRequest[] = [];
@@ -287,9 +288,10 @@ describe("seedProfileWindow", () => {
     assert.equal(r.success, false);
     assert.equal(r.error.kind, "discovery_failed");
     assert.match(r.error.message, /no verified user-data-dir endpoint linkage/i);
-    assert.match(r.error.message, /older version without transport provenance/i);
-    assert.match(r.error.message, /\/browser-reload-daemon/);
-    assert.ok(r.error.message.includes(legacyDaemonHint()));
+    assert.match(r.error.message, /cannot be proven to belong to/i);
+    assert.match(r.error.message, /\/browser-setup/);
+    assert.match(r.error.message, /\/browser-profile/);
+    assert.ok(r.error.message.includes(unlinkedEndpointHint(pin)));
     assert.deepEqual(s.launches, [], "zero launches on unverified endpoint");
     assert.equal(s.fake.calls.length, 0);
   });

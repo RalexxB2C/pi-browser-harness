@@ -12,7 +12,7 @@ import type { SeedDeps } from "../../src/profile/bind";
 const PAGE_JSON = JSON.stringify({ url: "https://one.test/", title: "One", w: 1, h: 2, sx: 0, sy: 0, pw: 3, ph: 4 });
 
 const started = async (canned: Canned = {}) => {
-  const stub = createStubTransport({
+    const stub = createStubTransport({
     "Target.setDiscoverTargets": ok({}),
     "Target.getTargets": ok({
       targetInfos: [
@@ -25,6 +25,9 @@ const started = async (canned: Canned = {}) => {
     "Target.activateTarget": ok({}),
     "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
     ...canned,
+  }, {
+    wsUrl: "ws://127.0.0.1:1/devtools/browser/abc",
+    browserId: "abc",
   });
   const client = createBrowserClient({
     namespace: "test",
@@ -109,6 +112,10 @@ describe("BrowserClient initialization with profile pin and machine dependencies
       const stub = createStubTransport({
         "Target.setDiscoverTargets": ok({}),
         "Target.getTargets": ok({ targetInfos: [] }),
+      }, {
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+        browserId: "abc",
+        userDataDir: pin.userDataDir,
       });
 
       const client = createBrowserClient({
@@ -160,6 +167,10 @@ describe("BrowserClient initialization with profile pin and machine dependencies
       "Target.detachFromTarget": ok({}),
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    }, {
+      wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+      browserId: "abc",
+      userDataDir: pin.userDataDir,
     });
 
     const client = createBrowserClient({
@@ -235,6 +246,10 @@ describe("BrowserClient initialization with profile pin and machine dependencies
     const stub = createStubTransport({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": ok({ targetInfos: [] }),
+    }, {
+      wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+      browserId: "abc",
+      userDataDir: pin.userDataDir,
     });
 
     const client = createBrowserClient({
@@ -297,5 +312,91 @@ describe("BrowserClient initialization with profile pin and machine dependencies
     assert.equal(launches.length, 0, "must fail before spawn when actual transport does not match pinned profile");
     assert.equal(client.userDataDir(), "/home/u/.config/browser-B");
     assert.equal(client.browserId(), "browser-B");
+  });
+
+  test("health reattach generation check: pin change during reattach aborts publication and latches failure", async () => {
+    let seedBlocked = true;
+    let seedResolved: () => void = () => undefined;
+    const seedBlockPromise = new Promise<void>((resolve) => {
+      seedResolved = resolve;
+    });
+
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve({ running: true, exePath: chromeExe, explicitUserDataDir: pin.userDataDir }),
+      resolveBrowserExecutable: () => Promise.resolve(chromeExe),
+      openProfileWindow: async (req) => {
+        launches.push(req);
+        if (seedBlocked) {
+          await seedBlockPromise;
+        }
+        return ok({ sentinelUrl, cleanup: () => Promise.resolve(), kill: () => undefined });
+      },
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        // initial start
+        ok({ targetInfos: [{ targetId: "tab-init", type: "page", title: "", url: sentinelUrl, browserContextId: "ctx-work" }] }),
+        ok({ targetInfos: [{ targetId: "tab-init", type: "page", title: "", url: "about:blank", browserContextId: "ctx-work" }] }),
+        // reattach seed
+        ok({ targetInfos: [{ targetId: "tab-reattach", type: "page", title: "", url: sentinelUrl, browserContextId: "ctx-work" }] }),
+        ok({ targetInfos: [{ targetId: "tab-reattach", type: "page", title: "", url: "about:blank", browserContextId: "ctx-work" }] }),
+      ],
+      "Target.attachToTarget": [ok({ sessionId: "s-init" }), ok({ sessionId: "s-reattach" })],
+      "Browser.getWindowForTarget": ok({ windowId: 10 }),
+      "Page.navigate": ok({}),
+      "Target.detachFromTarget": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    }, {
+      wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+      browserId: "abc",
+      userDataDir: pin.userDataDir,
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-reattach-generation",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc", userDataDir: pin.userDataDir },
+      profilePin: pin,
+      seedDeps,
+      discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc" })),
+    });
+
+    // Initial start succeeds without blocking
+    seedBlocked = false;
+    const r1 = await client.start();
+    assert.equal(r1.success, true);
+    assert.equal(launches.length, 1);
+
+    // Prepare block for reattach seed
+    seedBlocked = true;
+
+    // Invalidate session and clear ownership so reattach must seed
+    await client.detach();
+    client.ownership().replaceAll([]);
+    client.ownership().setHarnessWindow(undefined);
+
+    // Now call ensureAlive: sees !session.current() so triggers restart -> start -> seedIfPinned
+    const inFlightReattach = client.ensureAlive();
+    await new Promise((r) => setTimeout(r, 10));
+
+    // Pin changes while reattach seed is in flight!
+    const defaultPin: ProfilePin = { userDataDir: pin.userDataDir, profileDir: "Default", label: "Default", savedAt: "" };
+    client.setProfilePin(defaultPin);
+
+    seedBlocked = false;
+    seedResolved();
+
+    const r2 = await inFlightReattach;
+    assert.equal(r2.success, false);
+    assert.match(r2.error.message, /profile pin changed/i);
+
+    // Generation failure is latched: subsequent ordinary check returns latched error without retry
+    const r3 = await client.ensureAlive();
+    assert.equal(r3.success, false);
+    assert.match(r3.error.message, /profile pin changed/i);
   });
 });

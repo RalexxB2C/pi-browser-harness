@@ -1,7 +1,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { createBrowserClient } from "../../src/client";
-import { createStubTransport } from "../domains/fake-client";
+import { createStubTransport, type Canned } from "../domains/fake-client";
 import { ok } from "../../src/util/result";
 import type { ProfilePin } from "../../src/profile/store";
 import type { BrowserCandidate } from "../../src/profile/browser-process";
@@ -54,12 +54,23 @@ const createMockSeedDeps = (opts: {
   pollMs: 10,
 });
 
+const createMockStub = (
+  canned: Canned = {},
+  pin: ProfilePin = defaultPin,
+  browserId = "b1",
+) =>
+  createStubTransport(canned, {
+    wsUrl: `ws://127.0.0.1:9222/devtools/browser/${browserId}`,
+    browserId,
+    userDataDir: pin.userDataDir,
+  });
+
 describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
   test("fresh client with eligible persisted ownership in resolved default context reuses target with zero launches", async () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": ok({
         targetInfos: [
@@ -71,7 +82,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Browser.getWindowForTarget": [ok({ windowId: 10 }), ok({ windowId: 999 })],
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, defaultPin);
 
     const client = createBrowserClient({
       namespace: "test-reuse-default",
@@ -103,7 +114,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: workPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": ok({
         targetInfos: [
@@ -115,7 +126,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Browser.getWindowForTarget": [ok({ windowId: 11 }), ok({ windowId: 999 })],
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, workPin);
 
     const client = createBrowserClient({
       namespace: "test-reuse-named",
@@ -147,7 +158,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": [
         // Before seed: only foreign tab exists
@@ -169,7 +180,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Target.detachFromTarget": ok({}),
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, defaultPin);
 
     const client = createBrowserClient({
       namespace: "test-no-ownership",
@@ -192,7 +203,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": [
         // Stale target is gone; only foreign tab exists
@@ -213,7 +224,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Target.detachFromTarget": ok({}),
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, defaultPin);
 
     const client = createBrowserClient({
       namespace: "test-stale-target",
@@ -243,7 +254,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": [
         // Connected to browser B: coincidental tab "tab-from-a" exists as a user tab in browser B!
@@ -266,7 +277,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Target.detachFromTarget": ok({}),
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, defaultPin, "browser-b");
 
     // Client was configured with remote browser "browser-a", but transport connects to "browser-b"
     const client = createBrowserClient({
@@ -303,14 +314,14 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       targetUserDataDir: defaultPin.userDataDir,
     });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": ok({
         targetInfos: [
           { targetId: "hw-tab", type: "page", title: "Tab", url: "https://example.test/" },
         ],
       }),
-    });
+    }, defaultPin);
 
     const client = createBrowserClient({
       namespace: "test-ambiguous-reuse",
@@ -340,7 +351,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": [
         // Multiple unowned user tabs exist with NO browserContextId (default context)
@@ -372,7 +383,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Target.detachFromTarget": ok({}),
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, defaultPin);
 
     const client = createBrowserClient({
       namespace: "test-context-absence",
@@ -396,14 +407,14 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": ok({
         targetInfos: [
           { targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" },
         ],
       }),
-    });
+    }, workPin);
 
     const client = createBrowserClient({
       namespace: "test-pin-change",
@@ -436,7 +447,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": [
         ok({
@@ -464,7 +475,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Target.detachFromTarget": ok({}),
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, defaultPin);
 
     // Initial ownership was for workPin, but client is started with defaultPin
     const client = createBrowserClient({
@@ -495,7 +506,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const launches: ProfileWindowRequest[] = [];
     const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: workPin.userDataDir });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": [
         ok({
@@ -523,7 +534,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       "Target.detachFromTarget": ok({}),
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
-    });
+    }, workPin);
 
     // Unpinned snapshot has no profilePin in initialOwnership
     const client = createBrowserClient({
@@ -573,7 +584,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       ph: 600,
     });
 
-    const stub = createStubTransport({
+    const stub = createMockStub({
       "Target.setDiscoverTargets": ok({}),
       "Target.getTargets": [
         // Work initial start: ensureHarnessWindow checks existing
@@ -602,7 +613,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
         ok({ result: { type: "string", value: WORK_PAGE } }),
         ok({ result: { type: "string", value: DEFAULT_PAGE } }),
       ],
-    });
+    }, defaultPin);
 
     const client = createBrowserClient({
       namespace: "test-pin-change-read",
@@ -708,25 +719,20 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       seedDeps,
     });
 
-    // 1. Initial start seeds window in browser-1
     const r1 = await client.start();
     assert.equal(r1.success, true);
     assert.equal(launches.length, 1, "initial start must seed 1 window");
     assert.equal(client.owns("seed-1"), true);
 
-    // 2. Stop client
     await client.stop();
 
-    // 3. Restart client against SAME browser-1
     const r2 = await client.start();
     assert.equal(r2.success, true);
     assert.equal(launches.length, 1, "same browser restart must reuse existing window with zero launches");
     assert.equal(client.owns("seed-1"), true);
 
-    // 4. Stop client
     await client.stop();
 
-    // 5. Browser changes to browser-2
     activeBrowserId = "browser-2";
 
     const r3 = await client.start();
@@ -793,27 +799,216 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
       discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b1" })),
     });
 
-    // Start in-flight seed for Work pin
     const inFlightStart = client.start();
-
-    // Wait a tick so seed is running and blocked in openProfileWindow
     await new Promise((r) => setTimeout(r, 10));
     assert.equal(launches.length, 1);
 
-    // Profile pin is changed to Default while seed is still in flight!
     client.setProfilePin(defaultPin);
     assert.equal(client.profilePin()?.profileDir, "Default");
 
-    // Now let the old seed complete
     seedBlocked = false;
     seedResolved();
 
-    // The in-flight start MUST fail with discovery_failed and must NOT publish work window under Default pin
     const r = await inFlightStart;
     assert.equal(r.success, false);
     assert.match(r.error.message, /profile pin changed/i);
     assert.equal(client.owns("seed-race"), false, "old seed tab must NOT be owned under new pin");
     assert.equal(client.ownership().harnessWindow(), undefined);
+    assert.equal(client.profileContext().kind, "unresolved");
+  });
+
+  test("barrier verify -> spawn race: pin change during identity verification aborts before launch", async () => {
+    let verifyBlocked = true;
+    let verifyResolved: () => void = () => undefined;
+    const verifyBlockPromise = new Promise<void>((resolve) => {
+      verifyResolved = resolve;
+    });
+
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: async () => {
+        if (verifyBlocked) {
+          await verifyBlockPromise;
+        }
+        return {
+          running: true,
+          exePath: chromeExe,
+          explicitUserDataDir: workPin.userDataDir,
+        };
+      },
+      resolveBrowserExecutable: () => Promise.resolve(chromeExe),
+      openProfileWindow: (req) => {
+        launches.push(req);
+        return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+      },
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": ok({ targetInfos: [] }),
+    });
+
+    const transport = {
+      ...stub.transport,
+      actualEndpoint: () => ({
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/b1",
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+      }),
+    };
+
+    const client = createBrowserClient({
+      namespace: "test-verify-spawn-race",
+      transport,
+      profilePin: workPin,
+      seedDeps,
+      discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b1" })),
+    });
+
+    const inFlightStart = client.start();
+    await new Promise((r) => setTimeout(r, 10));
+
+    client.setProfilePin(defaultPin);
+
+    verifyBlocked = false;
+    verifyResolved();
+
+    const r = await inFlightStart;
+    assert.equal(r.success, false);
+    assert.match(r.error.message, /profile pin changed/i);
+    assert.equal(launches.length, 0, "pre-launch generation check must prevent spawn");
+  });
+
+  test("null and ABA pin changes: Pin A -> null -> Pin A is detected by generation identity and rejects publication", async () => {
+    let seedBlocked = true;
+    let seedResolved: () => void = () => undefined;
+    const seedBlockPromise = new Promise<void>((resolve) => {
+      seedResolved = resolve;
+    });
+
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve({
+        running: true,
+        exePath: chromeExe,
+        explicitUserDataDir: workPin.userDataDir,
+      }),
+      resolveBrowserExecutable: () => Promise.resolve(chromeExe),
+      openProfileWindow: async (req) => {
+        launches.push(req);
+        if (seedBlocked) {
+          await seedBlockPromise;
+        }
+        return ok({ sentinelUrl: "file:///tmp/sentinel-aba.html", cleanup: () => Promise.resolve(), kill: () => undefined });
+      },
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        ok({ targetInfos: [{ targetId: "seed-aba", type: "page", title: "", url: "file:///tmp/sentinel-aba.html", browserContextId: "ctx-work" }] }),
+        ok({ targetInfos: [{ targetId: "seed-aba", type: "page", title: "", url: "about:blank", browserContextId: "ctx-work" }] }),
+      ],
+      "Target.attachToTarget": [ok({ sessionId: "s-aba" })],
+      "Browser.getWindowForTarget": ok({ windowId: 99 }),
+      "Page.navigate": ok({}),
+      "Target.detachFromTarget": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    });
+
+    const transport = {
+      ...stub.transport,
+      actualEndpoint: () => ({
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/b1",
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+      }),
+    };
+
+    const client = createBrowserClient({
+      namespace: "test-pin-aba",
+      transport,
+      profilePin: workPin,
+      seedDeps,
+      discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b1" })),
+    });
+
+    const inFlightStart = client.start();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(launches.length, 1);
+
+    client.setProfilePin(null);
+    client.setProfilePin(workPin);
+
+    seedBlocked = false;
+    seedResolved();
+
+    const r = await inFlightStart;
+    assert.equal(r.success, false);
+    assert.match(r.error.message, /profile pin changed/i);
+    assert.equal(client.owns("seed-aba"), false, "ABA race must not publish old seed window");
+  });
+
+  test("Q1: constructor opts.remote does not authorize daemon spawn when transport evidence is absent", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve({
+        running: true,
+        exePath: chromeExe,
+        explicitUserDataDir: workPin.userDataDir,
+      }),
+      resolveBrowserExecutable: () => Promise.resolve(chromeExe),
+      openProfileWindow: (req) => {
+        launches.push(req);
+        return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+      },
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": ok({ targetInfos: [] }),
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-remote-bypass",
+      transport: stub.transport,
+      remote: {
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/remote-b",
+        browserId: "remote-b",
+        userDataDir: workPin.userDataDir,
+      },
+      profilePin: workPin,
+      seedDeps,
+    });
+
+    const r = await client.start();
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /no verified user-data-dir endpoint linkage/i);
+    assert.equal(launches.length, 0, "constructor remote must not authorize spawn without transport evidence");
+  });
+
+  test("Q6: initialOwnership without matching namespace does not preload IDs or adopt tabs", () => {
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": ok({ targetInfos: [] }),
+    });
+
+    const client = createBrowserClient({
+      namespace: "target-namespace",
+      transport: stub.transport,
+      initialOwnership: {
+        ownedTargetIds: ["unproven-1", "unproven-2"],
+        harnessWindowTargetId: "unproven-1",
+        harnessWindowId: 42,
+      },
+    });
+
+    assert.equal(client.owns("unproven-1"), false, "unproven tabs must not be owned");
+    assert.equal(client.owns("unproven-2"), false);
+    assert.equal(client.ownership().harnessWindow(), undefined);
+    assert.equal(client.ownership().harnessWindowId(), undefined);
     assert.equal(client.profileContext().kind, "unresolved");
   });
 });

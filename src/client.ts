@@ -123,22 +123,39 @@ const parsePageInfoPayload = (raw: string): Result<PageInfo, CdpError> => {
   });
 };
 
+const samePin = (
+  a?: { readonly userDataDir: string; readonly profileDir: string } | null,
+  b?: ProfilePin | null,
+): boolean => {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.userDataDir === b.userDataDir && a.profileDir === b.profileDir;
+};
+
 export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient => {
   const transport = opts.transport;
+  const initialProvenanceValid =
+    opts.initialOwnership?.namespace === opts.namespace &&
+    opts.initialOwnership.browserId !== undefined &&
+    (opts.profilePin
+      ? opts.initialOwnership.profilePin !== undefined && samePin(opts.initialOwnership.profilePin, opts.profilePin)
+      : opts.initialOwnership.profilePin === undefined);
+
+  const init = initialProvenanceValid ? opts.initialOwnership : undefined;
   const ownershipInit: { ownedTargetIds?: ReadonlyArray<string>; harnessWindowTargetId?: string; harnessWindowId?: number } = {};
-  if (opts.initialOwnership?.ownedTargetIds !== undefined) {
-    ownershipInit.ownedTargetIds = opts.initialOwnership.ownedTargetIds;
+  if (init?.ownedTargetIds !== undefined) {
+    ownershipInit.ownedTargetIds = init.ownedTargetIds;
   }
-  if (opts.initialOwnership?.harnessWindowTargetId !== undefined) {
-    ownershipInit.harnessWindowTargetId = opts.initialOwnership.harnessWindowTargetId;
+  if (init?.harnessWindowTargetId !== undefined) {
+    ownershipInit.harnessWindowTargetId = init.harnessWindowTargetId;
   }
-  if (opts.initialOwnership?.harnessWindowId !== undefined) {
-    ownershipInit.harnessWindowId = opts.initialOwnership.harnessWindowId;
+  if (init?.harnessWindowId !== undefined) {
+    ownershipInit.harnessWindowId = init.harnessWindowId;
   }
   const ownership = createOwnershipRegistry(ownershipInit);
-  let profileContext: ProfileContext = opts.initialOwnership?.profileContext
-    ?? (opts.initialOwnership?.profileContextId !== undefined
-      ? { kind: "named", contextId: opts.initialOwnership.profileContextId }
+  let profileContext: ProfileContext = init?.profileContext
+    ?? (init?.profileContextId !== undefined
+      ? { kind: "named", contextId: init.profileContextId }
       : { kind: "unresolved" });
   let profileContextId: string | undefined = profileContext.kind === "named" ? profileContext.contextId : undefined;
 
@@ -174,18 +191,18 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   let healthCheck: Promise<Result<void, CdpError>> | null = null;
   const pageCaches = new Map<string, { readonly info: PageInfo; readonly at: number }>();
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
-  let userDataDir: string | undefined = opts.remote?.userDataDir;
+  let userDataDir: string | undefined;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
 
   let registryProvenance: {
     readonly namespace: string;
     readonly browserId?: string | undefined;
     readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string } | undefined;
-  } | null = opts.initialOwnership?.namespace
+  } | null = init
     ? {
-        namespace: opts.initialOwnership.namespace,
-        browserId: opts.initialOwnership.browserId,
-        profilePin: opts.initialOwnership.profilePin,
+        namespace: opts.namespace,
+        browserId: init.browserId,
+        profilePin: init.profilePin,
       }
     : null;
 
@@ -206,10 +223,8 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       return ok(undefined);
     }
     let wsUrl: string;
-    let transportUserDataDir: string | undefined;
     if (opts.remote?.cdpUrl) {
       wsUrl = opts.remote.cdpUrl;
-      transportUserDataDir = opts.remote.userDataDir;
     } else {
       const discover = opts.discoverEndpoint ?? discoverEndpoint;
       const discovered = await discover();
@@ -235,17 +250,19 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       }
     }
 
+    // Authoritative connected transport proof ONLY: constructor opts.remote must not authorize daemon spawn
     const actual = transport.actualEndpoint?.();
     let newBrowserId: string;
+    let transportUserDataDir: string | undefined;
     if (actual) {
       if (actual.wsUrl) wsUrl = actual.wsUrl;
       transportUserDataDir = actual.userDataDir;
       newBrowserId = actual.browserId ?? (actual.wsUrl ? actual.wsUrl.split("/").pop() ?? "unknown" : "unknown");
     } else {
-      newBrowserId = opts.remote ? (wsUrl.split("/").pop() ?? "unknown") : "unknown";
+      transportUserDataDir = undefined;
+      newBrowserId = "unknown";
     }
 
-    // Clear old proof each attempt: never let stale remote authorize spawn or reuse
     userDataDir = transportUserDataDir;
 
     const samePin = (
@@ -358,19 +375,33 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
   const reattach = async (): Promise<Result<void, CdpError>> => {
     if (latchedInitFailure) return err(latchedInitFailure);
+    const myGen = pinGeneration;
     const seeded = await seedIfPinned();
     if (!seeded.success) {
       latchedInitFailure = seeded.error;
       await stop();
       return seeded;
     }
-    const reattached = await session.attachFirstPage();
-    if (reattached.success) {
-      latchedInitFailure = null;
-      pageCaches.clear();
-      return ok(undefined);
+    if (pinGeneration !== myGen) {
+      const genErr = cdpError("discovery_failed", "profile pin changed during initialization");
+      latchedInitFailure = genErr;
+      await stop();
+      return err(genErr);
     }
-    return restart();
+    const reattached = await session.attachFirstPage();
+    if (!reattached.success) {
+      latchedInitFailure = reattached.error;
+      return restart();
+    }
+    if (pinGeneration !== myGen) {
+      const genErr = cdpError("discovery_failed", "profile pin changed during initialization");
+      latchedInitFailure = genErr;
+      await stop();
+      return err(genErr);
+    }
+    latchedInitFailure = null;
+    pageCaches.clear();
+    return ok(undefined);
   };
 
   // Two probes: the browser one proves the socket works, the page one proves the current session does.
@@ -560,9 +591,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     userDataDir: () => userDataDir,
     profilePin: () => profilePin,
     setProfilePin: (pin) => {
-      const changed = pin === null
-        ? profilePin !== null
-        : profilePin?.userDataDir !== pin.userDataDir || profilePin.profileDir !== pin.profileDir;
+      const changed = !samePin(profilePin, pin);
       profilePin = pin;
       if (changed) {
         pinGeneration++;
@@ -606,7 +635,17 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       if (!profilePin) {
         return err(cdpError("discovery_failed", "no browser profile is selected — run /browser-profile"));
       }
-      return seedProfileWindow(api, profilePin, opts.seedDeps);
+      const myGen = pinGeneration;
+      const r = await seedProfileWindow(api, profilePin, opts.seedDeps, () => pinGeneration === myGen);
+      if (pinGeneration !== myGen) {
+        const genErr = cdpError("discovery_failed", "profile pin changed during initialization");
+        latchedInitFailure = genErr;
+        return err(genErr);
+      }
+      if (!r.success) {
+        latchedInitFailure = r.error;
+      }
+      return r;
     },
     mutationMutex: () => mutationMutex,
     browserId: () => remote?.browserId ?? opts.initialOwnership?.browserId,

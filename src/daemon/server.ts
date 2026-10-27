@@ -28,6 +28,7 @@ export type IpcServerOptions = {
   readonly socketPath?: string;
   readonly maxClients?: number;
   readonly provenance?: () => { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
+  readonly awaitReady?: (timeoutMs: number) => Promise<boolean>;
 };
 
 export type IpcServer = {
@@ -115,24 +116,31 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
               return;
             }
 
-            // Mutate in place so the already-captured closure sees the promoted client.
-            anonymous.delete(tempId);
-            client.id = clientId;
-            client.registered = true;
-            clients.set(clientId, client);
+            const finishRegistration = async () => {
+              if (options.awaitReady && !options.provenance?.()) {
+                await options.awaitReady(5_000);
+              }
+              if (socket.destroyed) return;
+              anonymous.delete(tempId);
+              client.id = clientId;
+              client.registered = true;
+              clients.set(clientId, client);
 
-            const prov = options.provenance?.();
-            const ack: WireControl = {
-              type: "control",
-              action: "registered",
-              clientId,
-              ...(prov?.browserId !== undefined ? { browserId: prov.browserId } : {}),
-              ...(prov?.userDataDir !== undefined ? { userDataDir: prov.userDataDir } : {}),
-              ...(prov?.cdpUrl !== undefined ? { cdpUrl: prov.cdpUrl } : {}),
+              const prov = options.provenance?.();
+              const ack: WireControl = {
+                type: "control",
+                action: "registered",
+                clientId,
+                ...(prov?.browserId !== undefined ? { browserId: prov.browserId } : {}),
+                ...(prov?.userDataDir !== undefined ? { userDataDir: prov.userDataDir } : {}),
+                ...(prov?.cdpUrl !== undefined ? { cdpUrl: prov.cdpUrl } : {}),
+              };
+              socket.write(serialize(ack) + "\n");
+
+              for (const h of connectHandlers) h(client);
             };
-            socket.write(serialize(ack) + "\n");
 
-            for (const h of connectHandlers) h(client);
+            void finishRegistration();
             return;
           }
 
