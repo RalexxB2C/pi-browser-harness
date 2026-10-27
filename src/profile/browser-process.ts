@@ -348,20 +348,12 @@ export const selectBrowserCandidate = (
   const familyMatches = candidates.filter((c) => rankBrowserCandidate(c, preferUserDataDir) === 3);
   if (familyMatches.length > 0) {
     const distinctExes = Array.from(new Set(familyMatches.map((c) => c.exePath).filter((p): p is string => Boolean(p))));
-    if (distinctExes.length > 1) {
-      return {
-        running: true,
-        ambiguous: true,
-        error: `ambiguous browser identity: multiple candidates (${distinctExes.join(", ")}) found without an explicit user-data-dir flag for ${preferUserDataDir}`,
-      };
-    }
-    if (distinctExes.length === 1) {
-      const matchExe = distinctExes[0];
-      return {
-        running: true,
-        ...(matchExe ? { exePath: matchExe } : {}),
-      };
-    }
+    const candidateList = distinctExes.length > 0 ? distinctExes.join(", ") : "unknown";
+    return {
+      running: true,
+      ambiguous: true,
+      error: `ambiguous browser identity: candidate (${candidateList}) lacks an explicit user-data-dir flag for ${preferUserDataDir}`,
+    };
   }
 
   return {

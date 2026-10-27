@@ -150,6 +150,12 @@ const runHandler = async <S extends TSchema, D extends TSchema>(
   extensionCtx: ExtensionContext,
 ): Promise<Result<ToolOk<DetailsOf<D>>, ToolErr>> => {
   if (def.ensureAlive !== false) {
+    const latched = client.latchedFailure();
+    if (latched) {
+      return notConnected(`Browser harness connection failed (${latched.kind}): ${latched.message}`, {
+        category: latched.kind,
+      });
+    }
     if (!(await daemonSocketMayExist())) {
       return notConnected("Browser harness not initialized. Run /browser-setup first");
     }

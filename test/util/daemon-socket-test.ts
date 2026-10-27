@@ -138,6 +138,7 @@ const runGate = async (ensureAlive: boolean | undefined): Promise<GateProbe> => 
   const partialClient = {
     mutationMutex: () => ({ acquire: () => Promise.resolve(() => undefined) }),
     ensureAlive: () => Promise.resolve(ok(undefined)),
+    latchedFailure: () => null,
   };
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- partial fake: the gate only reaches mutationMutex and ensureAlive
   const client = partialClient as unknown as BrowserClient;

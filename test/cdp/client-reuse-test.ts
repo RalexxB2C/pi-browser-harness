@@ -76,9 +76,12 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const client = createBrowserClient({
       namespace: "test-reuse-default",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        browserId: "b1",
+        userDataDir: defaultPin.userDataDir,
+        profilePin: defaultPin,
         ownedTargetIds: ["hw-default"],
         harnessWindowTargetId: "hw-default",
         profileContext: { kind: "default" },
@@ -116,9 +119,12 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const client = createBrowserClient({
       namespace: "test-reuse-named",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
       profilePin: workPin,
       initialOwnership: {
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+        profilePin: workPin,
         ownedTargetIds: ["hw-work"],
         harnessWindowTargetId: "hw-work",
         profileContext: { kind: "named", contextId: "ctx-work" },
@@ -166,7 +172,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const client = createBrowserClient({
       namespace: "test-no-ownership",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: { ownedTargetIds: [] },
       seedDeps,
@@ -210,9 +216,12 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const client = createBrowserClient({
       namespace: "test-stale-target",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        browserId: "b1",
+        userDataDir: defaultPin.userDataDir,
+        profilePin: defaultPin,
         ownedTargetIds: ["stale-dead-tab"],
         harnessWindowTargetId: "stale-dead-tab",
       },
@@ -260,9 +269,12 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const client = createBrowserClient({
       namespace: "test-browser-change",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-b", browserId: "browser-a" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-b", browserId: "browser-a", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        browserId: "browser-a",
+        userDataDir: defaultPin.userDataDir,
+        profilePin: defaultPin,
         ownedTargetIds: ["tab-from-a"],
         harnessWindowTargetId: "tab-from-a",
         profileContext: { kind: "default" },
@@ -299,9 +311,12 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const client = createBrowserClient({
       namespace: "test-ambiguous-reuse",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       initialOwnership: {
+        browserId: "b1",
+        userDataDir: defaultPin.userDataDir,
+        profilePin: defaultPin,
         ownedTargetIds: ["hw-tab"],
         harnessWindowTargetId: "hw-tab",
         profileContext: { kind: "default" },
@@ -357,7 +372,7 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     const client = createBrowserClient({
       namespace: "test-context-absence",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
       profilePin: defaultPin,
       // Fresh client with no prior ownership
       initialOwnership: { ownedTargetIds: [] },
@@ -370,5 +385,102 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     assert.equal(client.owns("user-gmail"), false);
     assert.equal(client.owns("user-docs"), false);
     assert.equal(client.owns("harness-seed"), true);
+  });
+
+  test("profile pin change clears ownership and prevents adopting old window", () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": ok({
+        targetInfos: [
+          { targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" },
+        ],
+      }),
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-pin-change",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
+      profilePin: workPin,
+      initialOwnership: {
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+        profilePin: workPin,
+        ownedTargetIds: ["hw-work"],
+        harnessWindowTargetId: "hw-work",
+        profileContext: { kind: "named", contextId: "ctx-work" },
+      },
+      seedDeps,
+    });
+
+    assert.equal(client.owns("hw-work"), true);
+    assert.equal(client.ownership().harnessWindow(), "hw-work");
+
+    // Changing pin to Default clears ownership
+    client.setProfilePin(defaultPin);
+    assert.equal(client.owns("hw-work"), false, "ownership must be cleared on pin change");
+    assert.equal(client.ownership().harnessWindow(), undefined, "harness window must be cleared on pin change");
+    assert.equal(client.profileContext().kind, "unresolved");
+  });
+
+  test("fresh client with restored ownership from different pin rejects reuse and launches verified window", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        ok({
+          targetInfos: [
+            { targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" },
+          ],
+        }),
+        // Sentinel poll
+        ok({
+          targetInfos: [
+            { targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" },
+            { targetId: "seed-default", type: "page", title: "", url: sentinelUrl },
+          ],
+        }),
+        ok({
+          targetInfos: [
+            { targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" },
+            { targetId: "seed-default", type: "page", title: "", url: "about:blank" },
+          ],
+        }),
+      ],
+      "Target.attachToTarget": [ok({ sessionId: "s-seed" }), ok({ sessionId: "s-main" })],
+      "Browser.getWindowForTarget": [ok({ windowId: 77 }), ok({ windowId: 77 }), ok({ windowId: 999 })],
+      "Page.navigate": ok({}),
+      "Target.detachFromTarget": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    });
+
+    // Initial ownership was for workPin, but client is started with defaultPin
+    const client = createBrowserClient({
+      namespace: "test-pin-mismatch",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: defaultPin.userDataDir },
+      profilePin: defaultPin,
+      initialOwnership: {
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+        profilePin: workPin,
+        ownedTargetIds: ["hw-work"],
+        harnessWindowTargetId: "hw-work",
+        profileContext: { kind: "named", contextId: "ctx-work" },
+      },
+      seedDeps,
+    });
+
+    const r = await client.start();
+    assert.equal(r.success, true);
+    assert.equal(launches.length, 1, "must launch new window for Default pin, not reuse Work pin window");
+    assert.equal(client.owns("hw-work"), false, "must not own work window");
+    assert.equal(client.owns("seed-default"), true, "must own new default window");
   });
 });

@@ -10,6 +10,9 @@ import { type CdpEvent, type CdpTransport } from "../../src/cdp/types";
 import { defineBrowserTool } from "../../src/util/tool";
 import { DAEMON_SOCKET_PATH } from "../../src/daemon/protocol";
 import { err, ok, type Result } from "../../src/util/result";
+import type { ProfilePin } from "../../src/profile/store";
+import type { SeedDeps } from "../../src/profile/bind";
+import type { ProfileWindowRequest } from "../../src/profile/launch";
 
 type MockTransportOptions = {
   connectResult?: () => Promise<Result<void, CdpError>>;
@@ -96,27 +99,23 @@ describe("BrowserClient initialization failure latching & recovery", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test-b" },
     });
 
-    // Initial start fails
     const initRes = await client.start();
     assert.equal(initRes.success, false);
     assert.equal(initRes.error.kind, "discovery_failed");
     assert.equal(initRes.error.message, "No matching Chrome process");
     assert.equal(mock.connectCalls, 1);
 
-    // Sequential ensureAlive call must return latched error without attempting connect
     const aliveRes = await client.ensureAlive();
     assert.equal(aliveRes.success, false);
     assert.equal(aliveRes.error.kind, "discovery_failed");
     assert.equal(aliveRes.error.message, "No matching Chrome process");
     assert.equal(mock.connectCalls, 1, "Must NOT attempt connect again");
 
-    // Implicit start without reconnectNow returns latched error
     const implicitStart = await client.start();
     assert.equal(implicitStart.success, false);
     assert.equal(implicitStart.error.kind, "discovery_failed");
     assert.equal(mock.connectCalls, 1, "Must NOT attempt connect again on implicit start");
 
-    // Ordinary reads (pageInfo, listTabs) return latched error
     const pageRes = await client.pageInfo();
     assert.equal(pageRes.success, false);
     assert.equal(pageRes.error.kind, "discovery_failed");
@@ -208,25 +207,21 @@ describe("BrowserClient initialization failure latching & recovery", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test-b" },
     });
 
-    // First attempt fails
     const init = await client.start();
     assert.equal(init.success, false);
     assert.equal(init.error.message, "Attempt 1 failed");
     assert.equal(attempts, 1);
 
-    // Ordinary check is latched
     const check1 = await client.ensureAlive();
     assert.equal(check1.success, false);
     assert.equal(check1.error.message, "Attempt 1 failed");
     assert.equal(attempts, 1);
 
-    // Explicit retry with reconnectNow
     const retry = await client.start({ reconnectNow: true });
     assert.equal(retry.success, false);
     assert.equal(retry.error.message, "Attempt 2 failed");
     assert.equal(attempts, 2);
 
-    // Failure remains latched with updated error
     const check2 = await client.ensureAlive();
     assert.equal(check2.success, false);
     assert.equal(check2.error.message, "Attempt 2 failed");
@@ -274,6 +269,94 @@ describe("BrowserClient initialization failure latching & recovery", () => {
     assert.equal(attempts, 2);
   });
 
+  test("pinned client: explicit setup retry restores normal operation with profilePin and launch spy", async () => {
+    let launchSucceeds = false;
+    const launches: ProfileWindowRequest[] = [];
+    const pin: ProfilePin = {
+      userDataDir: "/home/u/.config/google-chrome",
+      profileDir: "Profile 1",
+      label: "Work",
+      savedAt: "",
+    };
+    const sentinelUrl = "file:///tmp/pi-sentinel.html";
+
+    const mock = createMockTransport({
+      requestResult: (method) => {
+        if (method === "Target.getTargets") {
+          return Promise.resolve(ok({
+            targetInfos: launchSucceeds
+              ? [
+                  { targetId: "seed-tab", type: "page", title: "", url: sentinelUrl, browserContextId: "ctx-1" },
+                ]
+              : [],
+          }));
+        }
+        if (method === "Target.attachToTarget") {
+          return Promise.resolve(ok({ sessionId: "s-seed" }));
+        }
+        if (method === "Browser.getWindowForTarget") {
+          return Promise.resolve(ok({ windowId: 10 }));
+        }
+        return Promise.resolve(undefined);
+      },
+    });
+
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve({
+        running: true,
+        exePath: "/usr/bin/google-chrome",
+        explicitUserDataDir: pin.userDataDir,
+      }),
+      resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+      openProfileWindow: (req) => {
+        launches.push(req);
+        if (!launchSucceeds) {
+          return Promise.resolve(err("failed to launch service window"));
+        }
+        return Promise.resolve(ok({
+          sentinelUrl,
+          cleanup: () => Promise.resolve(),
+          kill: () => undefined,
+        }));
+      },
+      deadlineMs: 2_000,
+      pollMs: 10,
+    };
+
+    const client = createBrowserClient({
+      namespace: "test-pinned-recovery",
+      transport: mock.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc", userDataDir: pin.userDataDir },
+      profilePin: pin,
+      seedDeps,
+    });
+
+    const initRes = await client.start();
+    assert.equal(initRes.success, false);
+    assert.match(initRes.error.message, /failed to launch/i);
+    assert.equal(launches.length, 1);
+
+    const check1 = await client.ensureAlive();
+    assert.equal(check1.success, false);
+    assert.match(check1.error.message, /failed to launch/i);
+    assert.equal(launches.length, 1, "Ordinary ensureAlive must NOT launch new window");
+
+    const pageRes = await client.pageInfo();
+    assert.equal(pageRes.success, false);
+    assert.equal(launches.length, 1, "Ordinary pageInfo must NOT launch new window");
+
+    launchSucceeds = true;
+
+    const retryRes = await client.start({ retrySetup: true });
+    assert.equal(retryRes.success, true, retryRes.success ? "" : retryRes.error.message);
+    assert.equal(launches.length, 2, "Explicit retry must permit second launch attempt");
+
+    const alive = await client.ensureAlive();
+    assert.equal(alive.success, true);
+    assert.equal(client.status().alive, true);
+    assert.equal(launches.length, 2, "Subsequent calls must not launch extra windows");
+  });
+
   test("automatic reconnect failure latches the error", async () => {
     let reconnectFails = false;
     let connectCalls = 0;
@@ -298,11 +381,9 @@ describe("BrowserClient initialization failure latching & recovery", () => {
     assert.equal(init.success, true);
     assert.equal(connectCalls, 1);
 
-    // Simulate connection drop
     reconnectFails = true;
     mock.setState("closed");
 
-    // ensureAlive notices closed transport and attempts restart, which fails
     const reconnectAttempt = await client.ensureAlive();
     assert.equal(reconnectAttempt.success, false);
     assert.equal(reconnectAttempt.error.message, "Browser crashed");
@@ -334,10 +415,8 @@ describe("BrowserClient initialization failure latching & recovery", () => {
     assert.equal(init.success, true);
     assert.equal(connectCalls, 1);
 
-    // Simulate transient connection drop
     mock.setState("closed");
 
-    // ensureAlive triggers restart and succeeds
     const recovered = await client.ensureAlive();
     assert.equal(recovered.success, true);
     assert.equal(connectCalls, 2);
@@ -364,13 +443,11 @@ describe("BrowserClient initialization failure latching & recovery", () => {
     const init = await client.start();
     assert.equal(init.success, true);
 
-    // Page-level evaluation fails
     evalShouldFail = true;
     const evalRes = await client.evaluateJs("foo.bar()");
     assert.equal(evalRes.success, false);
     assert.equal(evalRes.error.kind, "remote_error");
 
-    // Client is still healthy and alive
     evalShouldFail = false;
     const alive = await client.ensureAlive();
     assert.equal(alive.success, true);
@@ -468,6 +545,81 @@ describe("tool wrapper presentation under initialization failure", () => {
     );
 
     assert.equal(mock.connectCalls, 1, "Must not repeat connect on subsequent tool call");
+  });
+
+  test("sequential tool calls retain root cause after daemon socket removal", async () => {
+    if (!existsSync(DAEMON_SOCKET_PATH)) {
+      try {
+        closeSync(openSync(DAEMON_SOCKET_PATH, "w"));
+      } catch {
+        // Ignored
+      }
+    }
+
+    const mock = createMockTransport({
+      connectResult: () => Promise.resolve(err(cdpError("discovery_failed", "DevToolsActivePort not found in candidate directories"))),
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-socket-removal",
+      transport: mock.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test-b" },
+    });
+
+    const tool = defineBrowserTool({
+      name: "browser_probe_socket_removal",
+      label: "Socket Removal Test",
+      description: "probe",
+      promptSnippet: "probe",
+      promptGuidelines: [],
+      parameters: Type.Object({}),
+      concurrency: "parallel",
+      ensureAlive: true,
+      handler: () => Promise.resolve(ok({ text: "success" })),
+    });
+
+    let registeredTool: Pick<ToolDefinition, "execute"> | undefined;
+    tool.register({
+      registerTool: (td) => {
+        registeredTool = td;
+      },
+    }, client);
+    assert.ok(registeredTool);
+
+    const ctx = fakeCtx();
+
+    await assert.rejects(
+      async () => {
+        await registeredTool?.execute("id-1", {}, undefined, undefined, ctx.ctx);
+      },
+      (e: unknown) => {
+        assert.ok(e instanceof Error);
+        assert.match(e.message, /discovery_failed/);
+        assert.match(e.message, /DevToolsActivePort not found/);
+        return true;
+      },
+    );
+
+    if (existsSync(DAEMON_SOCKET_PATH)) {
+      try {
+        unlinkSync(DAEMON_SOCKET_PATH);
+      } catch {
+        // Ignored
+      }
+    }
+
+    await assert.rejects(
+      async () => {
+        await registeredTool?.execute("id-2", {}, undefined, undefined, ctx.ctx);
+      },
+      (e: unknown) => {
+        assert.ok(e instanceof Error);
+        assert.match(e.message, /discovery_failed/);
+        assert.match(e.message, /DevToolsActivePort not found/);
+        assert.doesNotMatch(e.message, /Run \/browser-setup first/);
+        return true;
+      },
+    );
   });
 });
 

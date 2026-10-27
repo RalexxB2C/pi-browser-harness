@@ -114,7 +114,7 @@ describe("BrowserClient initialization with profile pin and machine dependencies
       const client = createBrowserClient({
         namespace: "test-ambiguous",
         transport: stub.transport,
-        remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc" },
+        remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc", userDataDir: pin.userDataDir },
         profilePin: pin,
         seedDeps,
       });
@@ -165,7 +165,7 @@ describe("BrowserClient initialization with profile pin and machine dependencies
     const client = createBrowserClient({
       namespace: "test-verified",
       transport: stub.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc" },
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc", userDataDir: pin.userDataDir },
       profilePin: pin,
       seedDeps,
     });
@@ -180,5 +180,75 @@ describe("BrowserClient initialization with profile pin and machine dependencies
     });
     assert.equal(client.profileContextId(), "ctx-work");
     assert.equal(client.owns("seed-tab"), true);
+  });
+
+  test("start() with unknown endpoint (remote without userDataDir) fails closed with zero launches before spawn", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve({ running: true, exePath: chromeExe, explicitUserDataDir: pin.userDataDir }),
+      resolveBrowserExecutable: () => Promise.resolve(chromeExe),
+      openProfileWindow: (req) => {
+        launches.push(req);
+        return Promise.resolve(ok({
+          sentinelUrl,
+          cleanup: () => Promise.resolve(),
+          kill: () => undefined,
+        }));
+      },
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": ok({ targetInfos: [] }),
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-unknown-endpoint",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc" },
+      profilePin: pin,
+      seedDeps,
+    });
+
+    const r = await client.start();
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /no verified user-data-dir endpoint linkage/i);
+    assert.equal(launches.length, 0, "zero launches on unverified endpoint");
+  });
+
+  test("start() with sole CFT candidate lacking explicit flag fails closed before spawn with zero launches", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve(selectBrowserCandidate([{ exePath: cftExe }], pin.userDataDir)),
+      resolveBrowserExecutable: (r) => Promise.resolve(r?.ambiguous ? undefined : r?.exePath ?? chromeExe),
+      openProfileWindow: (req) => {
+        launches.push(req);
+        return Promise.resolve(ok({
+          sentinelUrl,
+          cleanup: () => Promise.resolve(),
+          kill: () => undefined,
+        }));
+      },
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": ok({ targetInfos: [] }),
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-sole-cft",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/abc", browserId: "abc", userDataDir: pin.userDataDir },
+      profilePin: pin,
+      seedDeps,
+    });
+
+    const r = await client.start();
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /ambiguous/i);
+    assert.equal(launches.length, 0, "zero launches for sole CFT candidate without explicit flag");
   });
 });

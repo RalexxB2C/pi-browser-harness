@@ -5,6 +5,7 @@ import { createOwnershipRegistry, type OwnershipRegistry } from "../../src/cdp/o
 import { type CdpError, cdpError } from "../../src/cdp/errors";
 import type { CdpEvent, CdpTransport, RefSignature } from "../../src/cdp/types";
 import type { BrowserClient } from "../../src/client";
+import type { ProfilePin } from "../../src/profile/store";
 import { createMutex } from "../../src/util/mutex";
 import { type Result, err, ok } from "../../src/util/result";
 import type { HandlerContext } from "../../src/util/tool";
@@ -100,6 +101,8 @@ export type FakeClientOptions = {
   readonly evaluate?: (expression: string, sessionId?: string) => Result<unknown, CdpError>;
   readonly refs?: ReadonlyArray<{ readonly ref: string; readonly backendId: number; readonly sig?: RefSignature }>;
   readonly ownedTargetIds?: ReadonlyArray<string>;
+  readonly userDataDir?: string;
+  readonly profilePin?: ProfilePin | null;
 };
 
 export type FakeClient = {
@@ -161,8 +164,8 @@ export const createFakeClient = async (opts: FakeClientOptions = {}): Promise<Fa
     current: () => session.current(),
     session: () => session,
     transport: () => stub.transport,
-    userDataDir: () => undefined,
-    profilePin: () => null,
+    userDataDir: () => opts.userDataDir,
+    profilePin: () => opts.profilePin ?? null,
     setProfilePin: noop,
     profileContext: () => ({ kind: "unresolved" }),
     setProfileContext: noop,
@@ -171,6 +174,8 @@ export const createFakeClient = async (opts: FakeClientOptions = {}): Promise<Fa
     verifyProfileIdentity: () => Promise.resolve(ok(undefined)),
     seedPinnedProfileWindow: () => Promise.resolve(notConfigured("seedPinnedProfileWindow")),
     mutationMutex: () => mutex,
+    browserId: () => undefined,
+    latchedFailure: () => null,
   };
 
   return {

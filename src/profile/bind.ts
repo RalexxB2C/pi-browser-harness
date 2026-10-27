@@ -47,7 +47,13 @@ export const verifyConnectedBrowserIdentity = async (
   const resolveExe = deps.resolveBrowserExecutable ?? resolveBrowserExecutable;
 
   const connectedDir = client.userDataDir();
-  if (connectedDir && connectedDir !== pin.userDataDir) {
+  if (!connectedDir) {
+    return err(cdpError(
+      "discovery_failed",
+      `could not verify connected browser identity for "${pin.label}": connected browser has no verified user-data-dir endpoint linkage — ${manualFallbackHint(pin)}`,
+    ));
+  }
+  if (connectedDir !== pin.userDataDir) {
     return err(cdpError(
       "discovery_failed",
       `the selected profile "${pin.label}" belongs to ${pin.userDataDir}, but the harness is connected to ${connectedDir}. ` +
@@ -55,7 +61,7 @@ export const verifyConnectedBrowserIdentity = async (
     ));
   }
 
-  const targetUserDataDir = connectedDir ?? pin.userDataDir;
+  const targetUserDataDir = connectedDir;
   const running = await detect(targetUserDataDir);
   if (running.ambiguous) {
     return err(cdpError(

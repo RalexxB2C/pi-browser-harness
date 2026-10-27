@@ -23,8 +23,15 @@ export type ProfileContext =
 export type BrowserClientOptions = {
   readonly namespace: string;
   readonly transport: CdpTransport;
-  readonly remote?: { readonly cdpUrl: string; readonly browserId: string };
+  readonly remote?: {
+    readonly cdpUrl: string;
+    readonly browserId: string;
+    readonly userDataDir?: string;
+  };
   readonly initialOwnership?: {
+    readonly browserId?: string;
+    readonly userDataDir?: string;
+    readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string };
     readonly ownedTargetIds?: ReadonlyArray<string>;
     readonly harnessWindowTargetId?: string;
     readonly harnessWindowId?: number;
@@ -33,16 +40,21 @@ export type BrowserClientOptions = {
   };
   readonly profilePin?: ProfilePin | null;
   readonly onOwnershipChange?: (snapshot: {
+    readonly browserId?: string | undefined;
+    readonly userDataDir?: string | undefined;
+    readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string } | undefined;
     readonly ownedTargetIds: ReadonlyArray<string>;
     readonly harnessWindowTargetId: string | undefined;
     readonly harnessWindowId: number | undefined;
-    readonly profileContext?: ProfileContext;
+    readonly profileContext?: ProfileContext | undefined;
   }) => void;
   readonly seedDeps?: SeedDeps;
 };
 
 export type BrowserClient = {
   readonly namespace: string;
+  browserId(): string | undefined;
+  latchedFailure(): CdpError | null;
   ensureAlive(): Promise<Result<void, CdpError>>;
   status(): DaemonStatus;
   // `reconnectNow` is for explicit human demand (/browser-setup, /browser-reload-daemon): it asks the
@@ -131,6 +143,11 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   const notifyOwnership = (): void => {
     if (opts.onOwnershipChange) {
       opts.onOwnershipChange({
+        browserId: remote?.browserId ?? opts.initialOwnership?.browserId,
+        userDataDir,
+        profilePin: profilePin
+          ? { userDataDir: profilePin.userDataDir, profileDir: profilePin.profileDir }
+          : undefined,
         ownedTargetIds: ownership.list(),
         harnessWindowTargetId: ownership.harnessWindow(),
         harnessWindowId: ownership.harnessWindowId(),
@@ -149,11 +166,12 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   const mutationMutex = createMutex();
   let latchedInitFailure: CdpError | null = null;
   let inFlightInit: Promise<Result<void, CdpError>> | null = null;
+  let inExplicitRetry = false;
   let lastHealth = 0;
   let healthCheck: Promise<Result<void, CdpError>> | null = null;
   const pageCaches = new Map<string, { readonly info: PageInfo; readonly at: number }>();
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
-  let userDataDir: string | undefined;
+  let userDataDir: string | undefined = opts.remote?.userDataDir ?? opts.initialOwnership?.userDataDir;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
 
   // With a pin set the window must exist BEFORE anything attaches, or attachFirstPage's bare Target.createTarget lands in the focus-derived default profile.
@@ -165,7 +183,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const doStart = async (
-    opts: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean } = {},
+    startOpts: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean } = {},
   ): Promise<Result<void, CdpError>> => {
     if (transport.state() === "open" && session.current()) {
       latchedInitFailure = null;
@@ -181,14 +199,14 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
         return discovered;
       }
       wsUrl = discovered.data.wsUrl;
-      userDataDir = discovered.data.userDataDir;
+      userDataDir = discovered.data.userDataDir ?? opts.initialOwnership?.userDataDir ?? userDataDir;
     }
     const connected = await transport.connect(wsUrl, { timeoutMs: 10_000 });
     if (!connected.success) {
       latchedInitFailure = connected.error;
       return connected;
     }
-    if (opts.reconnectNow) {
+    if (startOpts.reconnectNow) {
       // Only the daemon understands this; a direct Chrome transport answers "method not found",
       // which is fine because it has no cooldown to clear.
       const dialed = await transport.request(DAEMON_RECONNECT_METHOD, {}, { timeoutMs: 15_000 });
@@ -200,14 +218,26 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     }
 
     const newBrowserId: string = wsUrl.split("/").pop() ?? "unknown";
-    if (remote?.browserId !== newBrowserId) {
+    const expectedBrowserId = remote?.browserId ?? opts.initialOwnership?.browserId;
+    const samePin = (
+      a?: { readonly userDataDir: string; readonly profileDir: string } | null,
+      b?: ProfilePin | null,
+    ): boolean => {
+      if (!a && !b) return true;
+      if (!a || !b) return false;
+      return a.userDataDir === b.userDataDir && a.profileDir === b.profileDir;
+    };
+    const browserMatches = expectedBrowserId === newBrowserId;
+    const pinMatches = !opts.initialOwnership?.profilePin || samePin(opts.initialOwnership.profilePin, profilePin);
+
+    if (!browserMatches || !pinMatches) {
       profileContext = { kind: "unresolved" };
       profileContextId = undefined;
       ownership.replaceAll([]);
       ownership.setHarnessWindow(undefined);
       ownership.setHarnessWindowId(undefined);
     }
-    remote = { cdpUrl: wsUrl, browserId: newBrowserId };
+    remote = { cdpUrl: wsUrl, browserId: newBrowserId, ...(userDataDir ? { userDataDir } : {}) };
     const seeded = await seedIfPinned();
     if (!seeded.success) {
       latchedInitFailure = seeded.error;
@@ -236,9 +266,15 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     if (inFlightInit) {
       return inFlightInit;
     }
-    const running = doStart(opts).finally(() => {
-      inFlightInit = null;
-    });
+    const running = (async () => {
+      if (isExplicit) inExplicitRetry = true;
+      try {
+        return await doStart(opts);
+      } finally {
+        inFlightInit = null;
+        inExplicitRetry = false;
+      }
+    })();
     inFlightInit = running;
     return running;
   };
@@ -455,6 +491,9 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
         : profilePin?.userDataDir !== pin.userDataDir || profilePin.profileDir !== pin.profileDir;
       profilePin = pin;
       if (changed) {
+        ownership.replaceAll([]);
+        ownership.setHarnessWindow(undefined);
+        ownership.setHarnessWindowId(undefined);
         profileContext = { kind: "unresolved" };
         profileContextId = undefined;
         notifyOwnership();
@@ -484,13 +523,15 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       return ok(undefined);
     },
     seedPinnedProfileWindow: async () => {
-      if (latchedInitFailure) return err(latchedInitFailure);
+      if (latchedInitFailure && !inExplicitRetry) return err(latchedInitFailure);
       if (!profilePin) {
         return err(cdpError("discovery_failed", "no browser profile is selected — run /browser-profile"));
       }
       return seedProfileWindow(api, profilePin, opts.seedDeps);
     },
     mutationMutex: () => mutationMutex,
+    browserId: () => remote?.browserId ?? opts.initialOwnership?.browserId,
+    latchedFailure: () => latchedInitFailure,
   };
   return api;
 };

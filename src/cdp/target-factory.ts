@@ -129,7 +129,6 @@ const ensureHarnessWindowUncoordinated = async (
     return ok({ targetId: seeded.data, freshlyCreated: true });
   }
 
-  // Pinned profile: reuse is gated by the verified browser identity contract
   const idVerified = await client.verifyProfileIdentity();
   if (!idVerified.success) {
     return idVerified;
@@ -156,15 +155,10 @@ const ensureHarnessWindowUncoordinated = async (
     if (profileCtx.kind === "default") {
       return info.browserContextId === undefined;
     }
-    // If profile identity is unresolved:
-    // With eligible persisted ownership from this namespace/profile,
-    // the target must match the expected profile directory / context.
-    // If pin profileDir is not "Default" and target has no browserContextId,
-    // a non-default profile without browserContextId cannot be assumed from context absence alone.
-    if (pin.profileDir !== "Default" && info.browserContextId === undefined) {
-      return false;
+    if (pin.profileDir === "Default") {
+      return info.browserContextId === undefined;
     }
-    return true;
+    return info.browserContextId !== undefined;
   };
 
   if (ownedLive && isEligibleTarget(ownedLive)) {

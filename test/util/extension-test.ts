@@ -12,6 +12,9 @@ import { applyTruncation } from "../../src/util/truncate";
 import { asString, isRecord } from "../../src/util/guards";
 import { createFakeClient, createStubTransport } from "../domains/fake-client";
 import { fakeCtx, fakePi } from "../helpers/fake-pi";
+import type { ProfileWindowRequest } from "../../src/profile/launch";
+import type { SeedDeps } from "../../src/profile/bind";
+import { ok } from "../../src/util/result";
 
 // test/domains/extension-registration-test.ts covers the third-party tool seam and that contributed
 // tools reach pi on session_start. This file covers the extension's own wiring: flags, commands,
@@ -253,5 +256,102 @@ describe("createExtension wiring", () => {
     const ctx = fakeCtx();
     await w.pi.command("browser-status").handler("", ctx.ctx);
     assert.match(ctx.notices[0]?.message ?? "", /Browser: .*Connected/);
+  });
+
+  test("fresh reuse works through real createExtension entry point: eligible restored ownership reuses window with zero launches", async () => {
+    const savedCdpWs = process.env["BU_CDP_WS"];
+    process.env["BU_CDP_WS"] = "ws://127.0.0.1:9222/devtools/browser/b-entry";
+
+    const extPin: ProfilePin = { userDataDir: PIN.userDataDir, profileDir: "Default", label: "Alice", savedAt: "" };
+
+    try {
+      const launches: ProfileWindowRequest[] = [];
+      const PAGE_JSON = JSON.stringify({
+        url: "https://example.test/",
+        title: "Reused Page",
+        w: 800,
+        h: 600,
+        sx: 0,
+        sy: 0,
+        pw: 800,
+        ph: 600,
+      });
+      const stub = createStubTransport({
+        "Target.setDiscoverTargets": ok({}),
+        "Target.getTargets": ok({
+          targetInfos: [
+            { targetId: "tab-reused", type: "page", title: "Reused Page", url: "https://example.test/" },
+          ],
+        }),
+        "Target.attachToTarget": [ok({ sessionId: "s-reused" })],
+        "Browser.getWindowForTarget": ok({ windowId: 55 }),
+        "Target.activateTarget": ok({}),
+        "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+      });
+
+      const transport = {
+        ...stub.transport,
+        connect: () => Promise.resolve(ok(undefined)),
+      };
+
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: PIN.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({
+            sentinelUrl: "file:///tmp/sentinel.html",
+            cleanup: () => Promise.resolve(),
+            kill: () => undefined,
+          }));
+        },
+        deadlineMs: 2_000,
+        pollMs: 10,
+      };
+
+      const extension = createExtension({
+        createTransport: () => transport,
+        readPin: () => Promise.resolve(extPin),
+        seedDeps,
+      });
+
+      const pi = fakePi();
+      extension(pi.pi);
+
+      const ctx = fakeCtx({
+        branch: [
+          {
+            type: "custom",
+            customType: "browser-harness-state",
+            data: {
+              namespace: "fresh-session",
+              browserId: "b-entry",
+              userDataDir: PIN.userDataDir,
+              profilePin: extPin,
+              ownedTargetIds: ["tab-reused"],
+              harnessWindowTargetId: "tab-reused",
+              profileContext: { kind: "default" },
+            },
+          },
+        ],
+      });
+
+      await pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+
+      await pi.command("browser-reload-daemon").handler("", ctx.ctx);
+
+      await pi.command("browser-status").handler("", ctx.ctx);
+
+      assert.equal(launches.length, 0, "fresh reuse through createExtension must not launch any service window");
+      assert.match(ctx.notices.find((n) => n.message.includes("Browser:"))?.message ?? "", /Browser: .*Connected/);
+      assert.match(ctx.notices.find((n) => n.message.includes("Reused Page"))?.message ?? "", /Reused Page/);
+    } finally {
+      if (savedCdpWs === undefined) Reflect.deleteProperty(process.env, "BU_CDP_WS");
+      else process.env["BU_CDP_WS"] = savedCdpWs;
+    }
   });
 });

@@ -44,7 +44,7 @@ Then enable remote debugging in your browser — either open `chrome://inspect/#
 or relaunch the browser with `--remote-debugging-port=9222`.
 
 Finally, run `/browser-setup` in pi to connect. It's a one-time step — the connection survives across
-pi sessions and reconnects on its own when Chrome restarts.
+pi sessions and reconnects on its own when Chrome restarts. If initialization fails, the error is remembered and subsequent reads will not trigger repeated launches; run `/browser-setup` explicitly to recover.
 
 The first time you connect, you'll be asked which browser profile the agent should work in:
 
@@ -58,7 +58,7 @@ Select the browser profile the agent should use
 
 That choice is saved to `~/.pi/agent/browser-harness.json` and reused by every project until you
 change it with `/browser-profile`. It decides which logins, cookies, and extensions the agent works
-with, so pinning it keeps runs reproducible. Skip the prompt and the harness behaves as it always
+with, so pinning it keeps runs reproducible. When pinned, the harness verifies connected browser identity before opening a profile service window and reuses existing harness-owned windows safely across fresh clients without repeated launches. Note that read-only operations can trigger initial connection and profile-window setup on first use. Skip the prompt and the harness behaves as it always
 did: tabs open in whichever profile currently has focus.
 
 **Requires:** pi (latest) · Node.js ≥ 22 · Chrome, Chromium, Brave, or Edge
@@ -182,7 +182,7 @@ tabs or navigating the tab to another origin.
 | Tool | Purpose |
 |---|---|
 | `browser_run_script` | Run a temporary script with raw CDP and full Node access. See [Extending](#extending). |
-| `browser_setup` | Agent-callable setup. Idempotent — how the agent recovers from `not initialized` on its own. |
+| `browser_setup` | Explicit agent-callable setup to initialize or recover from an initialization failure latch. |
 
 `browser_snapshot`, `browser_network_requests`, `browser_console`, `browser_execute_js`,
 `browser_web_search`, and `browser_read_page` ship custom TUI rendering: compact by default,
@@ -454,7 +454,7 @@ rather than being copied into the browser prompt.
 |---|---|
 | `DevToolsActivePort not found` | Open `chrome://inspect/#remote-debugging`, tick **Discover network targets**, click **Allow**. Or relaunch with `--remote-debugging-port=9222`. |
 | `No browser instance running` | Chrome/Brave/Edge isn't open, or only helper processes remain. Open the browser, then `/browser-setup`. |
-| `Browser harness not initialized` | Run `/browser-setup` — or let the agent call `browser_setup` itself. |
+| `Browser harness not initialized` | Run `/browser-setup` — or let the agent explicitly call `browser_setup`. After a failed initialization, subsequent ordinary tools return that cause without retrying until explicit setup runs. |
 | `ref is stale` | The page re-rendered. Re-run `browser_snapshot` for fresh refs. |
 | Page looks loaded but content is missing | SPA still rendering. Use `browser_wait_for({ selector })`, not a fixed sleep. |
 | Click did nothing | Check `browser_console` for a thrown error, then `browser_network_requests` for a failed call. |

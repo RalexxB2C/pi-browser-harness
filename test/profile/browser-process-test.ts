@@ -109,6 +109,17 @@ describe("browser-process parsing and candidate ranking", () => {
       assert.match(result.error ?? "", /ambiguous/i);
     });
 
+    test("ambiguous zero-spawn: sole candidate (e.g. CFT) lacking explicit user-data-dir flag is rejected as ambiguous", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: cftExe },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, true);
+      assert.equal(result.exePath, undefined);
+      assert.match(result.error ?? "", /ambiguous browser identity/i);
+    });
+
     test("verified positive identity: ordinary explicit flag on Chrome outranks absent CFT in both orders", () => {
       const chromeExplicit: BrowserCandidate = { exePath: chromeExe, explicitUserDataDir: targetDir };
       const cftAbsent: BrowserCandidate = { exePath: cftExe };

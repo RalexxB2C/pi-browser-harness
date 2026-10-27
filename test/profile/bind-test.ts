@@ -54,10 +54,15 @@ const seeded = async (opts: {
   readonly exePath?: string | undefined;
   readonly launchError?: string;
   readonly deadlineMs?: number;
+  readonly userDataDir?: string | undefined;
 } = {}): Promise<Seeded> => {
   const fake = await createFakeClient(opts.canned === undefined ? {} : { canned: opts.canned });
   const contexts: Array<string | undefined> = [];
-  const client: BrowserClient = { ...fake.client, setProfileContextId: (id) => { contexts.push(id); } };
+  const client: BrowserClient = {
+    ...fake.client,
+    userDataDir: () => "userDataDir" in opts ? opts.userDataDir : pin.userDataDir,
+    setProfileContextId: (id) => { contexts.push(id); },
+  };
   const launches: ProfileWindowRequest[] = [];
   const detects: Array<string | undefined> = [];
   const sleeps: number[] = [];
@@ -261,6 +266,29 @@ describe("seedProfileWindow", () => {
     assert.equal(r2.error.kind, "discovery_failed");
     assert.match(r2.error.message, /ambiguous/i);
     assert.deepEqual(s2.launches, [], "order 2 produces zero launches");
+  });
+
+  test("sole CFT candidate without explicit user-data-dir flag fails closed before spawn with zero launches", async () => {
+    const cftCandidate: BrowserCandidate = { exePath: "/home/u/.agent-browser/browsers/chrome-150/chrome" };
+    const s = await seeded({
+      running: selectBrowserCandidate([cftCandidate], pin.userDataDir),
+    });
+    const r = await seedProfileWindow(s.client, pin, s.deps);
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /ambiguous/i);
+    assert.deepEqual(s.launches, [], "zero launches for sole CFT candidate without explicit flag");
+    assert.equal(s.fake.calls.length, 0);
+  });
+
+  test("unknown endpoint (client has no verified user-data-dir) fails closed before spawn with zero launches", async () => {
+    const s = await seeded({ userDataDir: undefined });
+    const r = await seedProfileWindow(s.client, pin, s.deps);
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /no verified user-data-dir endpoint linkage/i);
+    assert.deepEqual(s.launches, [], "zero launches on unverified endpoint");
+    assert.equal(s.fake.calls.length, 0);
   });
 
   test("mismatched running explicit user-data-dir produces a precise error and zero launches before spawn", async () => {

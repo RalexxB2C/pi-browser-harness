@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { type BrowserClient, type BrowserClientOptions, type ProfileContext, createBrowserClient } from "./client";
+import type { SeedDeps } from "./profile/bind";
 import { getBrowserSystemPrompt } from "./prompt";
 import { registerSetupCommand } from "./setup";
 import { registerProfileCommand } from "./profile/command";
@@ -53,6 +54,7 @@ export type ExtensionDeps = {
   readonly createTransport?: (namespace: string) => CdpTransport;
   readonly createClient?: (opts: BrowserClientOptions) => BrowserClient;
   readonly readPin?: () => Promise<ProfilePin | null>;
+  readonly seedDeps?: SeedDeps;
 };
 
 export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) => void) => (pi: ExtensionAPI): void => {
@@ -147,11 +149,17 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
       const transport = createTransport(restored.namespace);
 
       const initialOwnership: {
+        browserId?: string;
+        userDataDir?: string;
+        profilePin?: { userDataDir: string; profileDir: string };
         ownedTargetIds?: ReadonlyArray<string>;
         harnessWindowTargetId?: string;
         harnessWindowId?: number;
         profileContext?: ProfileContext;
       } = {};
+      if (restored.browserId !== undefined) initialOwnership.browserId = restored.browserId;
+      if (restored.userDataDir !== undefined) initialOwnership.userDataDir = restored.userDataDir;
+      if (restored.profilePin !== undefined) initialOwnership.profilePin = restored.profilePin;
       if (restored.ownedTargetIds !== undefined) initialOwnership.ownedTargetIds = restored.ownedTargetIds;
       if (restored.harnessWindowTargetId !== undefined) initialOwnership.harnessWindowTargetId = restored.harnessWindowTargetId;
       if (restored.harnessWindowId !== undefined) initialOwnership.harnessWindowId = restored.harnessWindowId;
@@ -161,10 +169,14 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
         namespace: restored.namespace,
         transport,
         profilePin,
+        ...(deps.seedDeps ? { seedDeps: deps.seedDeps } : {}),
         ...(Object.keys(initialOwnership).length > 0 ? { initialOwnership } : {}),
         onOwnershipChange: (snap) => {
           state = {
             ...(state ?? restored),
+            ...(snap.browserId !== undefined ? { browserId: snap.browserId } : {}),
+            ...(snap.userDataDir !== undefined ? { userDataDir: snap.userDataDir } : {}),
+            ...(snap.profilePin !== undefined ? { profilePin: snap.profilePin } : {}),
             ownedTargetIds: snap.ownedTargetIds,
             ...(snap.harnessWindowTargetId !== undefined
               ? { harnessWindowTargetId: snap.harnessWindowTargetId }
