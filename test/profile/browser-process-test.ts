@@ -291,13 +291,9 @@ describe("browser-process parsing and candidate ranking", () => {
       assert.equal(await resolveBrowserExecutable({ running: true, exePath: `${real} (deleted)` }), real);
     });
 
-    test(
-      "B7: an unspawnable path is not passed on as usable",
-      { skip: process.platform === "win32" },
-      async () => {
-        assert.equal(await resolveBrowserExecutable({ running: true, exePath: join(root, "absent") }), undefined);
-      },
-    );
+    test("B7: an unspawnable running path is not passed on as usable on any platform", async () => {
+      assert.equal(await resolveBrowserExecutable({ running: true, exePath: join(root, "absent") }), undefined);
+    });
 
     // A binary genuinely named "… (deleted)" must win over the stripped form; created last so the checks above see only the ordinary case.
     test("B7: a real file named '… (deleted)' is preferred over stripping", async () => {

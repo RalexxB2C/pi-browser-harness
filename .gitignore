@@ -18,6 +18,7 @@ data/
 # install dir and its lockfile); nothing here is read by pi or the build.
 .claude/
 .agents/
+.pi/
 skills-lock.json
 
 # Stray research notes and one-off scripts kept locally at the repo root.

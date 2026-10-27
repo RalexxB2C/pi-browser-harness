@@ -29,6 +29,7 @@ export type BrowserClientOptions = {
     readonly userDataDir?: string;
   };
   readonly initialOwnership?: {
+    readonly namespace?: string;
     readonly browserId?: string;
     readonly userDataDir?: string;
     readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string };
@@ -171,7 +172,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   let healthCheck: Promise<Result<void, CdpError>> | null = null;
   const pageCaches = new Map<string, { readonly info: PageInfo; readonly at: number }>();
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
-  let userDataDir: string | undefined = opts.remote?.userDataDir ?? opts.initialOwnership?.userDataDir;
+  let userDataDir: string | undefined = opts.remote?.userDataDir;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
 
   // With a pin set the window must exist BEFORE anything attaches, or attachFirstPage's bare Target.createTarget lands in the focus-derived default profile.
@@ -190,8 +191,10 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       return ok(undefined);
     }
     let wsUrl: string;
+    let transportUserDataDir: string | undefined;
     if (remote?.cdpUrl) {
       wsUrl = remote.cdpUrl;
+      transportUserDataDir = remote.userDataDir;
     } else {
       const discovered = await discoverEndpoint();
       if (!discovered.success) {
@@ -199,7 +202,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
         return discovered;
       }
       wsUrl = discovered.data.wsUrl;
-      userDataDir = discovered.data.userDataDir ?? opts.initialOwnership?.userDataDir ?? userDataDir;
+      transportUserDataDir = discovered.data.userDataDir;
     }
     const connected = await transport.connect(wsUrl, { timeoutMs: 10_000 });
     if (!connected.success) {
@@ -217,7 +220,17 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       }
     }
 
-    const newBrowserId: string = wsUrl.split("/").pop() ?? "unknown";
+    const actual = transport.actualEndpoint?.();
+    if (actual?.wsUrl) {
+      wsUrl = actual.wsUrl;
+    }
+    if (actual?.userDataDir !== undefined) {
+      transportUserDataDir = actual.userDataDir;
+    }
+
+    const newBrowserId: string = actual?.browserId ?? wsUrl.split("/").pop() ?? "unknown";
+    userDataDir = transportUserDataDir;
+
     const expectedBrowserId = remote?.browserId ?? opts.initialOwnership?.browserId;
     const samePin = (
       a?: { readonly userDataDir: string; readonly profileDir: string } | null,
@@ -228,9 +241,12 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       return a.userDataDir === b.userDataDir && a.profileDir === b.profileDir;
     };
     const browserMatches = expectedBrowserId === newBrowserId;
-    const pinMatches = !opts.initialOwnership?.profilePin || samePin(opts.initialOwnership.profilePin, profilePin);
+    const pinMatches = profilePin !== null
+      ? (opts.initialOwnership?.profilePin !== undefined && samePin(opts.initialOwnership.profilePin, profilePin))
+      : opts.initialOwnership?.profilePin === undefined;
+    const namespaceMatches = !opts.initialOwnership?.namespace || opts.initialOwnership.namespace === opts.namespace;
 
-    if (!browserMatches || !pinMatches) {
+    if (!browserMatches || !pinMatches || !namespaceMatches) {
       profileContext = { kind: "unresolved" };
       profileContextId = undefined;
       ownership.replaceAll([]);
@@ -349,6 +365,10 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
   const evaluateJs = async (expression: string, sessionId?: string): Promise<Result<unknown, CdpError>> => {
     if (latchedInitFailure) return err(latchedInitFailure);
+    if (!sessionId && !session.current()) {
+      const alive = await ensureAlive();
+      if (!alive.success) return alive;
+    }
     // Wrap only when the trimmed source *starts with* `return` — matching the substring anywhere silently turned expressions mentioning it into `undefined`.
     const trimmed = expression.trim();
     const isReturnStatement = /^return[\s(]/.test(trimmed);
@@ -365,6 +385,10 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
   const readPageInfo = async (): Promise<Result<PageInfo, CdpError>> => {
     if (latchedInitFailure) return err(latchedInitFailure);
+    if (!session.current()) {
+      const alive = await ensureAlive();
+      if (!alive.success) return alive;
+    }
     const dirty = session.drainPageInfoInvalidations();
     const currentTid = session.current()?.targetId;
     const cached = currentTid ? pageCaches.get(currentTid) : undefined;
@@ -496,6 +520,9 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
         ownership.setHarnessWindowId(undefined);
         profileContext = { kind: "unresolved" };
         profileContextId = undefined;
+        pageCaches.clear();
+        lastHealth = 0;
+        void detach();
         notifyOwnership();
       }
     },

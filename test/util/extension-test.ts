@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
 import browserHarnessExtension, { createExtension } from "../../src/index";
-import type { BrowserClient, BrowserClientOptions } from "../../src/client";
+import type { BrowserClient, BrowserClientOptions, ProfileContext } from "../../src/client";
 import type { ProfilePin } from "../../src/profile/store";
 import { ALL_TOOLS } from "../../src/registry";
 import { applyTruncation } from "../../src/util/truncate";
@@ -241,13 +241,26 @@ describe("createExtension wiring", () => {
 
   test("restored ownership from the branch reaches the client factory", async () => {
     const w = await wire();
+    w.pi.setFlag("browser-namespace", "matched-ns");
     const ctx = fakeCtx({
       branch: [
-        { type: "custom", customType: "browser-harness-state", data: { namespace: "old", ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 } },
+        { type: "custom", customType: "browser-harness-state", data: { namespace: "matched-ns", ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 } },
       ],
     });
     await w.pi.emit("session_start", { type: "session_start" }, ctx.ctx);
-    assert.deepEqual(w.clientOpts[0]?.initialOwnership, { ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 });
+    assert.deepEqual(w.clientOpts[0]?.initialOwnership, { namespace: "matched-ns", ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 });
+  });
+
+  test("cross-namespace ownership rejection: branch state from namespace A is rejected when running in namespace B", async () => {
+    const w = await wire();
+    w.pi.setFlag("browser-namespace", "namespace-B");
+    const ctx = fakeCtx({
+      branch: [
+        { type: "custom", customType: "browser-harness-state", data: { namespace: "namespace-A", ownedTargetIds: ["tab-A"], harnessWindowTargetId: "tab-A", harnessWindowId: 1 } },
+      ],
+    });
+    await w.pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+    assert.deepEqual(w.clientOpts[0]?.initialOwnership, { namespace: "namespace-B", ownedTargetIds: [] });
   });
 
   test("browser-status after session_start reports the injected client's pin", async () => {
@@ -292,6 +305,11 @@ describe("createExtension wiring", () => {
       const transport = {
         ...stub.transport,
         connect: () => Promise.resolve(ok(undefined)),
+        actualEndpoint: () => ({
+          wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-entry",
+          browserId: "b-entry",
+          userDataDir: PIN.userDataDir,
+        }),
       };
 
       const seedDeps: SeedDeps = {
@@ -320,6 +338,7 @@ describe("createExtension wiring", () => {
       });
 
       const pi = fakePi();
+      pi.setFlag("browser-namespace", "fresh-session");
       extension(pi.pi);
 
       const ctx = fakeCtx({
@@ -353,5 +372,91 @@ describe("createExtension wiring", () => {
       if (savedCdpWs === undefined) Reflect.deleteProperty(process.env, "BU_CDP_WS");
       else process.env["BU_CDP_WS"] = savedCdpWs;
     }
+  });
+
+  test("cleared harness window persists deletion and fresh createExtension restores undefined", async () => {
+    let capturedOnOwnershipChange: ((snap: {
+      readonly browserId?: string | undefined;
+      readonly userDataDir?: string | undefined;
+      readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string } | undefined;
+      readonly ownedTargetIds: ReadonlyArray<string>;
+      readonly harnessWindowTargetId: string | undefined;
+      readonly harnessWindowId: number | undefined;
+      readonly profileContext?: ProfileContext | undefined;
+    }) => void) | undefined;
+
+    const fakeClient = await createFakeClient();
+    const extension1 = createExtension({
+      createTransport: () => createStubTransport().transport,
+      createClient: (o) => {
+        capturedOnOwnershipChange = o.onOwnershipChange;
+        return fakeClient.client;
+      },
+      readPin: () => Promise.resolve(PIN),
+    });
+
+    const pi1 = fakePi();
+    pi1.setFlag("browser-namespace", "team-persist");
+    extension1(pi1.pi);
+
+    const branch: Array<{ type: string; customType: string; data: unknown }> = [];
+    const ctx1 = fakeCtx({ branch });
+    // Intercept appendEntry to record into branch
+    pi1.pi.appendEntry = (customType: string, data: unknown) => {
+      branch.push({ type: "custom", customType, data });
+    };
+
+    await pi1.emit("session_start", { type: "session_start" }, ctx1.ctx);
+
+    // Initial state with a window
+    capturedOnOwnershipChange?.({
+      browserId: "b1",
+      userDataDir: PIN.userDataDir,
+      profilePin: PIN,
+      ownedTargetIds: ["w1"],
+      harnessWindowTargetId: "w1",
+      harnessWindowId: 10,
+      profileContext: { kind: "default" },
+    });
+
+    assert.equal(branch.length, 1);
+    const firstSaved = isRecord(branch[0]?.data) ? branch[0].data : {};
+    assert.equal(firstSaved["harnessWindowTargetId"], "w1");
+
+    // Clearing the harness window (e.g. pin changed or cleared)
+    capturedOnOwnershipChange?.({
+      browserId: "b1",
+      userDataDir: PIN.userDataDir,
+      profilePin: PIN,
+      ownedTargetIds: [],
+      harnessWindowTargetId: undefined,
+      harnessWindowId: undefined,
+      profileContext: { kind: "unresolved" },
+    });
+
+    assert.equal(branch.length, 2, "must append new entry reflecting deletion");
+    const secondSaved = isRecord(branch[1]?.data) ? branch[1].data : {};
+    assert.equal(secondSaved["harnessWindowTargetId"], undefined);
+
+    // Session 2: fresh createExtension instance restores from the updated branch
+    let session2InitialOwnership: BrowserClientOptions["initialOwnership"];
+    const extension2 = createExtension({
+      createTransport: () => createStubTransport().transport,
+      createClient: (o) => {
+        session2InitialOwnership = o.initialOwnership;
+        return fakeClient.client;
+      },
+      readPin: () => Promise.resolve(PIN),
+    });
+
+    const pi2 = fakePi();
+    pi2.setFlag("browser-namespace", "team-persist");
+    extension2(pi2.pi);
+    const ctx2 = fakeCtx({ branch });
+
+    await pi2.emit("session_start", { type: "session_start" }, ctx2.ctx);
+
+    assert.equal(session2InitialOwnership?.harnessWindowTargetId, undefined, "restored harnessWindowTargetId must be undefined");
+    assert.deepEqual(session2InitialOwnership?.ownedTargetIds, [], "restored ownedTargetIds must be empty");
   });
 });

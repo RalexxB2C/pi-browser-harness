@@ -1,6 +1,8 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { closeSync, openSync, unlinkSync, existsSync } from "node:fs";
+import { closeSync, openSync, unlinkSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { fakeCtx } from "../helpers/fake-pi";
@@ -8,7 +10,6 @@ import { createBrowserClient } from "../../src/client";
 import { cdpError, type CdpError } from "../../src/cdp/errors";
 import { type CdpEvent, type CdpTransport } from "../../src/cdp/types";
 import { defineBrowserTool } from "../../src/util/tool";
-import { DAEMON_SOCKET_PATH } from "../../src/daemon/protocol";
 import { err, ok, type Result } from "../../src/util/result";
 import type { ProfilePin } from "../../src/profile/store";
 import type { SeedDeps } from "../../src/profile/bind";
@@ -247,22 +248,18 @@ describe("BrowserClient initialization failure latching & recovery", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test-b" },
     });
 
-    // Fails initially
     const init = await client.start();
     assert.equal(init.success, false);
     assert.equal(attempts, 1);
 
-    // Ordinary calls blocked
     assert.equal((await client.ensureAlive()).success, false);
     assert.equal(attempts, 1);
 
-    // Fix condition and explicitly retry
     shouldSucceed = true;
     const recovery = await client.start({ reconnectNow: true });
     assert.equal(recovery.success, true);
     assert.equal(attempts, 2);
 
-    // Normal operation restored
     const alive = await client.ensureAlive();
     assert.equal(alive.success, true);
     assert.equal(client.status().alive, true);
@@ -376,7 +373,6 @@ describe("BrowserClient initialization failure latching & recovery", () => {
       remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test-b" },
     });
 
-    // Successfully start initially
     const init = await client.start();
     assert.equal(init.success, true);
     assert.equal(connectCalls, 1);
@@ -456,27 +452,26 @@ describe("BrowserClient initialization failure latching & recovery", () => {
 });
 
 describe("tool wrapper presentation under initialization failure", () => {
-  let createdSocket = false;
+  let tempDir: string;
+  let testSocketPath: string;
+  let savedSocketEnv: string | undefined;
 
   before(() => {
-    if (!existsSync(DAEMON_SOCKET_PATH)) {
-      try {
-        closeSync(openSync(DAEMON_SOCKET_PATH, "w"));
-        createdSocket = true;
-      } catch {
-        // Ignored if permissions prevent creating socket in /tmp
-      }
-    }
+    tempDir = mkdtempSync(join(tmpdir(), "pi-latch-test-"));
+    testSocketPath = join(tempDir, "daemon.sock");
+    savedSocketEnv = process.env["PI_BROWSER_SOCKET_PATH"];
+    process.env["PI_BROWSER_SOCKET_PATH"] = testSocketPath;
+    closeSync(openSync(testSocketPath, "w"));
+    assert.equal(existsSync(testSocketPath), true, "Test socket must exist after preparation");
   });
 
   after(() => {
-    if (createdSocket && existsSync(DAEMON_SOCKET_PATH)) {
-      try {
-        unlinkSync(DAEMON_SOCKET_PATH);
-      } catch {
-        // Ignored
-      }
+    if (savedSocketEnv === undefined) {
+      Reflect.deleteProperty(process.env, "PI_BROWSER_SOCKET_PATH");
+    } else {
+      process.env["PI_BROWSER_SOCKET_PATH"] = savedSocketEnv;
     }
+    rmSync(tempDir, { recursive: true, force: true });
   });
 
   test("tool execution retains underlying error category and sanitized cause on failure", async () => {
@@ -513,7 +508,6 @@ describe("tool wrapper presentation under initialization failure", () => {
 
     const ctx = fakeCtx();
 
-    // First tool call fails and throws error retaining category and cause
     await assert.rejects(
       async () => {
         await registeredTool?.execute("id-1", {}, undefined, undefined, ctx.ctx);
@@ -530,7 +524,6 @@ describe("tool wrapper presentation under initialization failure", () => {
 
     assert.equal(mock.connectCalls, 1);
 
-    // Sequential tool call returns latched error without attempting connect again
     await assert.rejects(
       async () => {
         await registeredTool?.execute("id-2", {}, undefined, undefined, ctx.ctx);
@@ -548,78 +541,82 @@ describe("tool wrapper presentation under initialization failure", () => {
   });
 
   test("sequential tool calls retain root cause after daemon socket removal", async () => {
-    if (!existsSync(DAEMON_SOCKET_PATH)) {
-      try {
-        closeSync(openSync(DAEMON_SOCKET_PATH, "w"));
-      } catch {
-        // Ignored
+    const seqTempDir = mkdtempSync(join(tmpdir(), "pi-latch-seq-"));
+    const seqSocketPath = join(seqTempDir, "seq-daemon.sock");
+    const prevSocket = process.env["PI_BROWSER_SOCKET_PATH"];
+    process.env["PI_BROWSER_SOCKET_PATH"] = seqSocketPath;
+
+    closeSync(openSync(seqSocketPath, "w"));
+    assert.equal(existsSync(seqSocketPath), true, "Isolated socket must exist before first tool call");
+
+    try {
+      const mock = createMockTransport({
+        connectResult: () => Promise.resolve(err(cdpError("discovery_failed", "DevToolsActivePort not found in candidate directories"))),
+      });
+
+      const client = createBrowserClient({
+        namespace: "test-socket-removal",
+        transport: mock.transport,
+        remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test-b" },
+      });
+
+      const tool = defineBrowserTool({
+        name: "browser_probe_socket_removal",
+        label: "Socket Removal Test",
+        description: "probe",
+        promptSnippet: "probe",
+        promptGuidelines: [],
+        parameters: Type.Object({}),
+        concurrency: "parallel",
+        ensureAlive: true,
+        handler: () => Promise.resolve(ok({ text: "success" })),
+      });
+
+      let registeredTool: Pick<ToolDefinition, "execute"> | undefined;
+      tool.register({
+        registerTool: (td) => {
+          registeredTool = td;
+        },
+      }, client);
+      assert.ok(registeredTool);
+
+      const ctx = fakeCtx();
+
+      await assert.rejects(
+        async () => {
+          await registeredTool?.execute("id-1", {}, undefined, undefined, ctx.ctx);
+        },
+        (e: unknown) => {
+          assert.ok(e instanceof Error);
+          assert.match(e.message, /discovery_failed/);
+          assert.match(e.message, /DevToolsActivePort not found/);
+          return true;
+        },
+      );
+
+      unlinkSync(seqSocketPath);
+      assert.equal(existsSync(seqSocketPath), false, "Isolated socket must be removed before second tool call");
+
+      await assert.rejects(
+        async () => {
+          await registeredTool?.execute("id-2", {}, undefined, undefined, ctx.ctx);
+        },
+        (e: unknown) => {
+          assert.ok(e instanceof Error);
+          assert.match(e.message, /discovery_failed/);
+          assert.match(e.message, /DevToolsActivePort not found/);
+          assert.doesNotMatch(e.message, /Run \/browser-setup first/);
+          return true;
+        },
+      );
+    } finally {
+      if (prevSocket === undefined) {
+        Reflect.deleteProperty(process.env, "PI_BROWSER_SOCKET_PATH");
+      } else {
+        process.env["PI_BROWSER_SOCKET_PATH"] = prevSocket;
       }
+      rmSync(seqTempDir, { recursive: true, force: true });
     }
-
-    const mock = createMockTransport({
-      connectResult: () => Promise.resolve(err(cdpError("discovery_failed", "DevToolsActivePort not found in candidate directories"))),
-    });
-
-    const client = createBrowserClient({
-      namespace: "test-socket-removal",
-      transport: mock.transport,
-      remote: { cdpUrl: "ws://127.0.0.1:9222/test", browserId: "test-b" },
-    });
-
-    const tool = defineBrowserTool({
-      name: "browser_probe_socket_removal",
-      label: "Socket Removal Test",
-      description: "probe",
-      promptSnippet: "probe",
-      promptGuidelines: [],
-      parameters: Type.Object({}),
-      concurrency: "parallel",
-      ensureAlive: true,
-      handler: () => Promise.resolve(ok({ text: "success" })),
-    });
-
-    let registeredTool: Pick<ToolDefinition, "execute"> | undefined;
-    tool.register({
-      registerTool: (td) => {
-        registeredTool = td;
-      },
-    }, client);
-    assert.ok(registeredTool);
-
-    const ctx = fakeCtx();
-
-    await assert.rejects(
-      async () => {
-        await registeredTool?.execute("id-1", {}, undefined, undefined, ctx.ctx);
-      },
-      (e: unknown) => {
-        assert.ok(e instanceof Error);
-        assert.match(e.message, /discovery_failed/);
-        assert.match(e.message, /DevToolsActivePort not found/);
-        return true;
-      },
-    );
-
-    if (existsSync(DAEMON_SOCKET_PATH)) {
-      try {
-        unlinkSync(DAEMON_SOCKET_PATH);
-      } catch {
-        // Ignored
-      }
-    }
-
-    await assert.rejects(
-      async () => {
-        await registeredTool?.execute("id-2", {}, undefined, undefined, ctx.ctx);
-      },
-      (e: unknown) => {
-        assert.ok(e instanceof Error);
-        assert.match(e.message, /discovery_failed/);
-        assert.match(e.message, /DevToolsActivePort not found/);
-        assert.doesNotMatch(e.message, /Run \/browser-setup first/);
-        return true;
-      },
-    );
   });
 });
 

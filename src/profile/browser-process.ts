@@ -377,8 +377,9 @@ export const isBrowserRunning = async (): Promise<boolean> => (await detectRunni
 export const resolveBrowserExecutable = async (running?: RunningBrowser): Promise<string | undefined> => {
   const detected = running ?? (await detectRunningBrowser());
   if (detected.ambiguous) return undefined;
-  const usable = detected.exePath ? await spawnableExePath(detected.exePath) : undefined;
-  if (usable) return usable;
+  if (detected.exePath) {
+    return spawnableExePath(detected.exePath);
+  }
   if (process.platform !== "win32") return undefined;
 
   const fromRegistry = await winRegistryExecutable();

@@ -110,10 +110,13 @@ export const deserialize = (line: string): WireMessage | null => {
 };
 
 // Windows requires a named pipe (`\\.\pipe\<name>`); a Unix path is not a valid `net` listen/connect target there.
-export const DAEMON_SOCKET_PATH =
-  process.platform === "win32"
+export const daemonSocketPath = (env: NodeJS.ProcessEnv = process.env): string =>
+  env["PI_BROWSER_SOCKET_PATH"] ??
+  (process.platform === "win32"
     ? "\\\\.\\pipe\\pi-browser-daemon"
-    : "/tmp/pi-browser-daemon.sock";
+    : "/tmp/pi-browser-daemon.sock");
+
+export const DAEMON_SOCKET_PATH = daemonSocketPath();
 
 export const DAEMON_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 

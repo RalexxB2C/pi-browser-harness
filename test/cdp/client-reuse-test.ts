@@ -483,4 +483,150 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     assert.equal(client.owns("hw-work"), false, "must not own work window");
     assert.equal(client.owns("seed-default"), true, "must own new default window");
   });
+
+  test("unpinned snapshot -> pinned profile rejects reuse and launches verified window", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: workPin.userDataDir });
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        ok({
+          targetInfos: [
+            { targetId: "unpinned-tab", type: "page", title: "Unpinned", url: "https://unpinned.test/" },
+          ],
+        }),
+        // Sentinel poll
+        ok({
+          targetInfos: [
+            { targetId: "unpinned-tab", type: "page", title: "Unpinned", url: "https://unpinned.test/" },
+            { targetId: "seed-work", type: "page", title: "", url: sentinelUrl, browserContextId: "ctx-work" },
+          ],
+        }),
+        ok({
+          targetInfos: [
+            { targetId: "unpinned-tab", type: "page", title: "Unpinned", url: "https://unpinned.test/" },
+            { targetId: "seed-work", type: "page", title: "", url: "about:blank", browserContextId: "ctx-work" },
+          ],
+        }),
+      ],
+      "Target.attachToTarget": [ok({ sessionId: "s-seed" }), ok({ sessionId: "s-work" })],
+      "Browser.getWindowForTarget": [ok({ windowId: 88 }), ok({ windowId: 88 }), ok({ windowId: 999 })],
+      "Page.navigate": ok({}),
+      "Target.detachFromTarget": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
+    });
+
+    // Unpinned snapshot has no profilePin in initialOwnership
+    const client = createBrowserClient({
+      namespace: "test-unpinned-to-pinned",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
+      profilePin: workPin,
+      initialOwnership: {
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+        ownedTargetIds: ["unpinned-tab"],
+        harnessWindowTargetId: "unpinned-tab",
+      },
+      seedDeps,
+    });
+
+    const r = await client.start();
+    assert.equal(r.success, true);
+    assert.equal(launches.length, 1, "unpinned snapshot must not be reused when client has a pinned profile");
+    assert.equal(client.owns("unpinned-tab"), false);
+    assert.equal(client.owns("seed-work"), true);
+  });
+
+  test("pin change invalidates active session, health TTL and page cache so subsequent ordinary reads access new profile", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps = createMockSeedDeps({ launches, targetUserDataDir: defaultPin.userDataDir });
+
+    const WORK_PAGE = JSON.stringify({
+      url: "https://work.test/",
+      title: "Work Page",
+      w: 800,
+      h: 600,
+      sx: 0,
+      sy: 0,
+      pw: 800,
+      ph: 600,
+    });
+    const DEFAULT_PAGE = JSON.stringify({
+      url: "https://default.test/",
+      title: "Default Page",
+      w: 800,
+      h: 600,
+      sx: 0,
+      sy: 0,
+      pw: 800,
+      ph: 600,
+    });
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": [
+        // Work initial start: ensureHarnessWindow checks existing
+        ok({ targetInfos: [{ targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" }] }),
+        // Work initial start: session.attachFirstPage discovers pages
+        ok({ targetInfos: [{ targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" }] }),
+        // After pin change to Default: ensureHarnessWindow checks existing
+        ok({ targetInfos: [{ targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" }] }),
+        // Default seedProfileWindow poll for sentinel
+        ok({ targetInfos: [
+          { targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" },
+          { targetId: "seed-def", type: "page", title: "", url: sentinelUrl },
+        ] }),
+        // Default attachFirstPage discovers pages
+        ok({ targetInfos: [
+          { targetId: "hw-work", type: "page", title: "Work Tab", url: "https://work.test/", browserContextId: "ctx-work" },
+          { targetId: "seed-def", type: "page", title: "", url: "about:blank" },
+        ] }),
+      ],
+      "Target.attachToTarget": [ok({ sessionId: "s-work" }), ok({ sessionId: "s-seed" }), ok({ sessionId: "s-def" })],
+      "Browser.getWindowForTarget": [ok({ windowId: 10 }), ok({ windowId: 20 }), ok({ windowId: 20 }), ok({ windowId: 999 })],
+      "Target.detachFromTarget": ok({}),
+      "Page.navigate": ok({}),
+      "Target.activateTarget": ok({}),
+      "Runtime.evaluate": [
+        ok({ result: { type: "string", value: WORK_PAGE } }),
+        ok({ result: { type: "string", value: DEFAULT_PAGE } }),
+      ],
+    });
+
+    const client = createBrowserClient({
+      namespace: "test-pin-change-read",
+      transport: stub.transport,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b1", browserId: "b1", userDataDir: workPin.userDataDir },
+      profilePin: workPin,
+      initialOwnership: {
+        browserId: "b1",
+        userDataDir: workPin.userDataDir,
+        profilePin: workPin,
+        ownedTargetIds: ["hw-work"],
+        harnessWindowTargetId: "hw-work",
+        profileContext: { kind: "named", contextId: "ctx-work" },
+      },
+      seedDeps,
+    });
+
+    const r1 = await client.start();
+    assert.equal(r1.success, true);
+    assert.equal(client.current()?.targetId, "hw-work");
+
+    const p1 = await client.pageInfo();
+    assert.equal(p1.success, true);
+    assert.match(p1.data.kind === "page" ? p1.data.title : "", /Work Page/);
+
+    client.setProfilePin(defaultPin);
+    assert.equal(client.current(), null, "active session must be detached on pin change");
+
+    const p2 = await client.pageInfo();
+    assert.equal(p2.success, true);
+    assert.match(p2.data.kind === "page" ? p2.data.title : "", /Default Page/);
+    assert.equal(client.current()?.targetId, "seed-def");
+    assert.equal(launches.length, 1, "must launch window for Default profile");
+  });
 });

@@ -251,4 +251,51 @@ describe("BrowserClient initialization with profile pin and machine dependencies
     assert.match(r.error.message, /ambiguous/i);
     assert.equal(launches.length, 0, "zero launches for sole CFT candidate without explicit flag");
   });
+
+  test("discovery A vs transport B: authoritative provenance of actual connected transport takes precedence and rejects mismatched pin", async () => {
+    const launches: ProfileWindowRequest[] = [];
+    const seedDeps: SeedDeps = {
+      detectRunningBrowser: () => Promise.resolve({ running: true, exePath: chromeExe, explicitUserDataDir: pin.userDataDir }),
+      resolveBrowserExecutable: () => Promise.resolve(chromeExe),
+      openProfileWindow: (req) => {
+        launches.push(req);
+        return Promise.resolve(ok({
+          sentinelUrl,
+          cleanup: () => Promise.resolve(),
+          kill: () => undefined,
+        }));
+      },
+    };
+
+    const stub = createStubTransport({
+      "Target.setDiscoverTargets": ok({}),
+      "Target.getTargets": ok({ targetInfos: [] }),
+    });
+
+    // Transport connects to browser B in dirB, despite remote/discovery pointing to A
+    const transportWithB = {
+      ...stub.transport,
+      actualEndpoint: () => ({
+        wsUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
+        browserId: "browser-B",
+        userDataDir: "/home/u/.config/browser-B",
+      }),
+    };
+
+    const client = createBrowserClient({
+      namespace: "test-discovery-vs-transport",
+      transport: transportWithB,
+      remote: { cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-A", browserId: "browser-A", userDataDir: pin.userDataDir },
+      profilePin: pin,
+      seedDeps,
+    });
+
+    const r = await client.start();
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /belongs to \/home\/u\/\.config\/google-chrome, but the harness is connected to \/home\/u\/\.config\/browser-B/);
+    assert.equal(launches.length, 0, "must fail before spawn when actual transport does not match pinned profile");
+    assert.equal(client.userDataDir(), "/home/u/.config/browser-B");
+    assert.equal(client.browserId(), "browser-B");
+  });
 });

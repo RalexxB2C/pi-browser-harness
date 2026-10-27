@@ -149,6 +149,7 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
       const transport = createTransport(restored.namespace);
 
       const initialOwnership: {
+        namespace?: string;
         browserId?: string;
         userDataDir?: string;
         profilePin?: { userDataDir: string; profileDir: string };
@@ -156,7 +157,9 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
         harnessWindowTargetId?: string;
         harnessWindowId?: number;
         profileContext?: ProfileContext;
-      } = {};
+      } = {
+        namespace: restored.namespace,
+      };
       if (restored.browserId !== undefined) initialOwnership.browserId = restored.browserId;
       if (restored.userDataDir !== undefined) initialOwnership.userDataDir = restored.userDataDir;
       if (restored.profilePin !== undefined) initialOwnership.profilePin = restored.profilePin;
@@ -173,11 +176,11 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
         ...(Object.keys(initialOwnership).length > 0 ? { initialOwnership } : {}),
         onOwnershipChange: (snap) => {
           state = {
-            ...(state ?? restored),
+            namespace: restored.namespace,
+            ownedTargetIds: snap.ownedTargetIds,
             ...(snap.browserId !== undefined ? { browserId: snap.browserId } : {}),
             ...(snap.userDataDir !== undefined ? { userDataDir: snap.userDataDir } : {}),
             ...(snap.profilePin !== undefined ? { profilePin: snap.profilePin } : {}),
-            ownedTargetIds: snap.ownedTargetIds,
             ...(snap.harnessWindowTargetId !== undefined
               ? { harnessWindowTargetId: snap.harnessWindowTargetId }
               : {}),

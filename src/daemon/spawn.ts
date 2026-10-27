@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createConnection } from "node:net";
 import { readLines } from "./lines";
-import { DAEMON_SOCKET_PATH, deserialize, serialize, type WireControl } from "./protocol";
+import { DAEMON_SOCKET_PATH, daemonSocketPath, deserialize, serialize, type WireControl } from "./protocol";
 import { destroyQuietly } from "./socket";
 
 const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -24,7 +24,7 @@ const cleanupStaleSocket = (): void => {
 
 export const daemonSocketMayExist = async (
   platform: NodeJS.Platform = process.platform,
-  socketPath: string = DAEMON_SOCKET_PATH,
+  socketPath: string = daemonSocketPath(),
 ): Promise<boolean> => {
   if (platform === "win32") return true;
   try {

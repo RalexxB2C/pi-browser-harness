@@ -95,4 +95,5 @@ export type CdpTransport = {
   events(): AsyncIterable<CdpEvent>;
   state(): "open" | "closed" | "connecting";
   onClose(cb: () => void): () => void;
+  actualEndpoint?(): { readonly wsUrl?: string; readonly browserId?: string; readonly userDataDir?: string };
 };
