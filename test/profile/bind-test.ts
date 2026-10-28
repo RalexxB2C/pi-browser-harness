@@ -313,33 +313,35 @@ describe("seedProfileWindow", () => {
     assert.equal(s.fake.calls.length, 0);
   });
 
-  test("verified positive identity permits the correct service-window launch with explicitUserDataDir", async () => {
-    const chromeCandidate: BrowserCandidate = {
-      exePath: EXE,
-      explicitUserDataDir: pin.userDataDir,
-    };
-    const cftCandidate: BrowserCandidate = {
-      exePath: "/home/u/.agent-browser/browsers/chrome-150/chrome",
-    };
-    const s = await seeded({
-      running: selectBrowserCandidate([cftCandidate, chromeCandidate], pin.userDataDir),
-      canned: {
-        "Target.getTargets": [
-          ok({ targetInfos: [page("t1", "https://example.test/")] }),
-          ok({ targetInfos: [page("seed", SENTINEL, "ctx-1")] }),
-        ],
-        "Target.attachToTarget": [ok({ sessionId: "s1" }), ok({ sessionId: "s-seed" })],
-        "Browser.getWindowForTarget": [ok({ windowId: 7 }), ok({ windowId: 42 })],
-      },
+  for (const kernelVerified of [false, true]) {
+    test(`verified identity permits service-window launch with ${kernelVerified ? "kernel socket ownership" : "explicit flag"}`, async () => {
+      const chromeCandidate: BrowserCandidate = {
+        exePath: EXE,
+        ...(kernelVerified ? { verifiedUserDataDir: pin.userDataDir } : { explicitUserDataDir: pin.userDataDir }),
+      };
+      const cftCandidate: BrowserCandidate = {
+        exePath: "/home/u/.agent-browser/browsers/chrome-150/chrome",
+      };
+      const s = await seeded({
+        running: selectBrowserCandidate([cftCandidate, chromeCandidate], pin.userDataDir),
+        canned: {
+          "Target.getTargets": [
+            ok({ targetInfos: [page("t1", "https://example.test/")] }),
+            ok({ targetInfos: [page("seed", SENTINEL, "ctx-1")] }),
+          ],
+          "Target.attachToTarget": [ok({ sessionId: "s1" }), ok({ sessionId: "s-seed" })],
+          "Browser.getWindowForTarget": [ok({ windowId: 7 }), ok({ windowId: 42 })],
+        },
+      });
+      const r = await seedProfileWindow(s.client, pin, s.deps);
+      assert.ok(r.success, r.success ? "" : r.error.message);
+      assert.deepEqual(s.launches, [{
+        exePath: EXE,
+        profileDir: "Profile 1",
+        explicitUserDataDir: pin.userDataDir,
+      }]);
     });
-    const r = await seedProfileWindow(s.client, pin, s.deps);
-    assert.ok(r.success, r.success ? "" : r.error.message);
-    assert.deepEqual(s.launches, [{
-      exePath: EXE,
-      profileDir: "Profile 1",
-      explicitUserDataDir: pin.userDataDir,
-    }]);
-  });
+  }
 
   test("verified positive identity with rewritten process-title explicit flag permits launch", async () => {
     const argv = parseProcCmdline(`${EXE} --user-data-dir=${pin.userDataDir}\0`);

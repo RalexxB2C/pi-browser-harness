@@ -2,8 +2,9 @@
 // `wmic` is deliberately unused — Microsoft removed it by default in Windows 11 24H2 and entirely in 25H2, so PowerShell CIM plus tasklist replace it.
 
 import { execFile } from "node:child_process";
-import { access, readFile, readlink } from "node:fs/promises";
-import { join } from "node:path";
+import { access, readFile, readlink, readdir, stat } from "node:fs/promises";
+import { hostname } from "node:os";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
@@ -17,6 +18,7 @@ export type RunningBrowser = {
   readonly running: boolean;
   readonly exePath?: string;
   readonly explicitUserDataDir?: string;
+  readonly verifiedUserDataDir?: string;
   readonly ambiguous?: boolean;
   readonly error?: string;
 };
@@ -77,6 +79,7 @@ const isMacChildProcessName = (comm: string): boolean => {
 export type BrowserCandidate = {
   readonly exePath?: string;
   readonly explicitUserDataDir?: string;
+  readonly verifiedUserDataDir?: string;
 };
 
 // A package upgrade under a running browser makes `/proc/<pid>/exe` read "… (deleted)", which fails to spawn with ENOENT unless the marker comes off.
@@ -117,6 +120,9 @@ export const rankBrowserCandidate = (candidate: BrowserCandidate, preferUserData
   if (candidate.explicitUserDataDir) {
     return samePath(candidate.explicitUserDataDir, preferUserDataDir) ? 4 : 0;
   }
+  if (candidate.verifiedUserDataDir) {
+    return samePath(candidate.verifiedUserDataDir, preferUserDataDir) ? 4 : 0;
+  }
   const family = browserNameForUserDataDir(preferUserDataDir).toLowerCase();
   const exe = (candidate.exePath ?? "").toLowerCase();
   if (!exe) return 1;
@@ -134,7 +140,42 @@ export const parseUserDataDirFlag = (commandLine: string): string | undefined =>
   return value && value.length > 0 ? value : undefined;
 };
 
-const collectLinux = async (): Promise<ReadonlyArray<BrowserCandidate>> => {
+export const linuxProfileOwnerPid = async (userDataDir: string): Promise<string | undefined> => {
+  try {
+    const lockPath = join(userDataDir, "SingletonLock");
+    const socketLink = join(userDataDir, "SingletonSocket");
+    const lock = await readlink(lockPath);
+    const prefix = `${hostname()}-`;
+    if (!lock.startsWith(prefix)) return undefined;
+    const pid = lock.slice(prefix.length);
+    if (!/^[1-9]\d*$/.test(pid)) return undefined;
+    if ((await stat(`/proc/${pid}`)).uid !== process.getuid?.()) return undefined;
+
+    const socketTarget = await readlink(socketLink);
+    const socketPath = resolve(userDataDir, socketTarget);
+    const sockets = await readFile("/proc/net/unix", "utf8");
+    for (const line of sockets.split("\n")) {
+      const match = /^\S+\s+\S+\s+\S+\s+00010000\s+0001\s+01\s+(\d+)\s+(.+)$/.exec(line);
+      if (match?.[2] !== socketPath) continue;
+      const expectedFd = `socket:[${match[1]}]`;
+      for (const fd of await readdir(`/proc/${pid}/fd`)) {
+        let target: string;
+        try {
+          target = await readlink(`/proc/${pid}/fd/${fd}`);
+        } catch {
+          continue;
+        }
+        // A stale lock or reused PID cannot prove ownership without the kernel socket.
+        if (target === expectedFd && await readlink(lockPath) === lock && await readlink(socketLink) === socketTarget) return pid;
+      }
+    }
+  } catch {
+    // Missing, stale, or inaccessible evidence must not relax identity verification.
+  }
+  return undefined;
+};
+
+const collectLinux = async (preferUserDataDir?: string): Promise<ReadonlyArray<BrowserCandidate>> => {
   let pids: string[];
   try {
     const { stdout } = await run("ps", ["-A", "-o", "pid=,comm="], { timeout: EXEC_TIMEOUT_MS });
@@ -150,6 +191,7 @@ const collectLinux = async (): Promise<ReadonlyArray<BrowserCandidate>> => {
     return [];
   }
 
+  const ownerPid = preferUserDataDir ? await linuxProfileOwnerPid(preferUserDataDir) : undefined;
   const candidates: BrowserCandidate[] = [];
   for (const pid of pids) {
     let argv: ReadonlyArray<string>;
@@ -174,6 +216,7 @@ const collectLinux = async (): Promise<ReadonlyArray<BrowserCandidate>> => {
     candidates.push({
       ...(exePath ? { exePath } : {}),
       ...(explicit ? { explicitUserDataDir: explicit } : {}),
+      ...(pid === ownerPid && preferUserDataDir ? { verifiedUserDataDir: preferUserDataDir } : {}),
     });
   }
   return candidates;
@@ -332,10 +375,12 @@ export const selectBrowserCandidate = (
     if (distinctExes.length === 1) {
       const matchExe = distinctExes[0];
       const matchDir = exactMatches[0]?.explicitUserDataDir;
+      const verifiedDir = exactMatches[0]?.verifiedUserDataDir;
       return {
         running: true,
         ...(matchExe ? { exePath: matchExe } : {}),
         ...(matchDir ? { explicitUserDataDir: matchDir } : {}),
+        ...(verifiedDir ? { verifiedUserDataDir: verifiedDir } : {}),
       };
     }
     return {
@@ -368,7 +413,7 @@ export const detectRunningBrowser = async (preferUserDataDir?: string): Promise<
       ? await collectDarwin()
       : process.platform === "win32"
         ? await collectWin32()
-        : await collectLinux();
+        : await collectLinux(preferUserDataDir);
   return selectBrowserCandidate(candidates, preferUserDataDir);
 };
 

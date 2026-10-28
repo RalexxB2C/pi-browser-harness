@@ -83,10 +83,11 @@ export const verifyConnectedBrowserIdentity = async (
         : `could not locate the browser executable needed to open "${pin.label}" — ${manualFallbackHint(pin)}`,
     ));
   }
-  if (running.explicitUserDataDir && running.explicitUserDataDir !== targetUserDataDir) {
+  const runningDir = running.explicitUserDataDir ?? running.verifiedUserDataDir;
+  if (runningDir && runningDir !== targetUserDataDir) {
     return err(cdpError(
       "discovery_failed",
-      `running browser's user-data-dir (${running.explicitUserDataDir}) does not match the pinned profile (${targetUserDataDir}) — ${manualFallbackHint(pin)}`,
+      `running browser's user-data-dir (${runningDir}) does not match the pinned profile (${targetUserDataDir}) — ${manualFallbackHint(pin)}`,
     ));
   }
   const exePath = await resolveExe(running);
@@ -135,12 +136,13 @@ export const seedProfileWindow = async (
   if (!preLaunchCheck.success) return preLaunchCheck;
 
   const { exePath, running } = verified.data;
+  const verifiedDir = running.explicitUserDataDir ?? running.verifiedUserDataDir;
 
   const launched = await launch({
     exePath,
     profileDir: pin.profileDir,
-    // ProcessSingleton keys on the user-data-dir path, so forward only the value the running browser reports: a reconstructed one may differ by case and start a SECOND browser.
-    ...(running.explicitUserDataDir ? { explicitUserDataDir: running.explicitUserDataDir } : {}),
+    // Forward only the directory proven by process arguments or kernel socket ownership.
+    ...(verifiedDir ? { explicitUserDataDir: verifiedDir } : {}),
   });
   if (!launched.success) {
     return err(cdpError("discovery_failed", `${launched.error} — ${manualFallbackHint(pin)}`));

@@ -1,10 +1,12 @@
 import { test, before, after, describe } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { homedir, hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   isLinuxBrowserComm,
+  linuxProfileOwnerPid,
   parseProcCmdline,
   parseUserDataDirFlag,
   rankBrowserCandidate,
@@ -15,6 +17,33 @@ import {
   userDataDirFromArgv,
   type BrowserCandidate,
 } from "../../src/profile/browser-process";
+
+test("Linux profile identity requires the local lock PID to own its listening singleton socket", { skip: process.platform !== "linux" }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "harness-owner-"));
+  const socket = join(dir, "socket");
+  const lock = join(dir, "SingletonLock");
+  const socketLink = join(dir, "SingletonSocket");
+  const server = createServer();
+  t.after(async () => {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socket, resolve));
+  symlinkSync(socket, socketLink);
+  symlinkSync(`${hostname()}-${process.pid}`, lock);
+  assert.equal(await linuxProfileOwnerPid(dir), String(process.pid));
+
+  unlinkSync(lock);
+  symlinkSync(`${hostname()}-${process.ppid}`, lock);
+  assert.equal(await linuxProfileOwnerPid(dir), undefined, "a live PID not owning the socket is insufficient");
+  unlinkSync(lock);
+  symlinkSync(`other-host-${process.pid}`, lock);
+  assert.equal(await linuxProfileOwnerPid(dir), undefined, "a remote host lock cannot identify a local browser");
+  unlinkSync(lock);
+  symlinkSync(`${hostname()}-${process.pid}`, lock);
+  await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+  assert.equal(await linuxProfileOwnerPid(dir), undefined, "a stale lock/socket link is insufficient");
+});
 
 describe("browser-process parsing and candidate ranking", () => {
   test("B1: bare value parsed", () => {
@@ -118,6 +147,19 @@ describe("browser-process parsing and candidate ranking", () => {
       assert.equal(result.ambiguous, true);
       assert.equal(result.exePath, undefined);
       assert.match(result.error ?? "", /ambiguous browser identity/i);
+    });
+
+    test("kernel-verified profile owner outranks flagless CFT without inventing an explicit flag", () => {
+      const owner: BrowserCandidate = { exePath: chromeExe, verifiedUserDataDir: targetDir };
+      for (const candidates of [[owner, { exePath: cftExe }], [{ exePath: cftExe }, owner]]) {
+        const result = selectBrowserCandidate(candidates, targetDir);
+        assert.equal(result.ambiguous, undefined);
+        assert.equal(result.exePath, chromeExe);
+        assert.equal(result.verifiedUserDataDir, targetDir);
+        assert.equal(result.explicitUserDataDir, undefined);
+      }
+      assert.equal(selectBrowserCandidate([owner], "/tmp/other-profile").exePath, undefined);
+      assert.equal(selectBrowserCandidate([{ ...owner, explicitUserDataDir: "/tmp/other-profile" }], targetDir).exePath, undefined);
     });
 
     test("verified positive identity: ordinary explicit flag on Chrome outranks absent CFT in both orders", () => {
