@@ -33,10 +33,16 @@ export type ControlAction = (typeof CONTROL_ACTIONS)[number];
 // Each action carries exactly the fields it needs, so a handler that has matched on `action`
 // never has to re-check what the guard already proved.
 export type WireRegister = { readonly type: "control"; readonly action: "register"; readonly clientId: string };
-export type WireRegistered = { readonly type: "control"; readonly action: "registered"; readonly clientId: string };
+export type WireRegistered = {
+  readonly type: "control";
+  readonly action: "registered";
+  readonly clientId: string;
+  readonly browserId?: string;
+  readonly userDataDir?: string;
+  readonly cdpUrl?: string;
+};
 export type WireDeregister = { readonly type: "control"; readonly action: "deregister"; readonly clientId: string };
 export type WireShutdown = { readonly type: "control"; readonly action: "shutdown"; readonly reason?: string };
-
 export type WireControl = WireRegister | WireRegistered | WireDeregister | WireShutdown;
 
 export type WireMessage = WireRequest | WireResponse | WireEvent | WireControl;
@@ -53,9 +59,15 @@ const isWireControl = (v: Record<string, unknown>): v is WireControl => {
   if (!isControlAction(action)) return false;
   switch (action) {
     case "register":
-    case "registered":
     case "deregister":
       return typeof v["clientId"] === "string";
+    case "registered":
+      return (
+        typeof v["clientId"] === "string" &&
+        isOptionalString(v["browserId"]) &&
+        isOptionalString(v["userDataDir"]) &&
+        isOptionalString(v["cdpUrl"])
+      );
     case "shutdown":
       return isOptionalString(v["reason"]);
   }
@@ -110,10 +122,13 @@ export const deserialize = (line: string): WireMessage | null => {
 };
 
 // Windows requires a named pipe (`\\.\pipe\<name>`); a Unix path is not a valid `net` listen/connect target there.
-export const DAEMON_SOCKET_PATH =
-  process.platform === "win32"
+export const daemonSocketPath = (env: NodeJS.ProcessEnv = process.env): string =>
+  env["PI_BROWSER_SOCKET_PATH"] ??
+  (process.platform === "win32"
     ? "\\\\.\\pipe\\pi-browser-daemon"
-    : "/tmp/pi-browser-daemon.sock";
+    : "/tmp/pi-browser-daemon.sock");
+
+export const DAEMON_SOCKET_PATH = daemonSocketPath();
 
 export const DAEMON_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 

@@ -5,40 +5,63 @@ import { parseJson } from "./schemas/parse";
 import { type Result, err, ok } from "./util/result";
 import { safeJs } from "./util/js-template";
 import { type Mutex, createMutex } from "./util/mutex";
-import { discoverEndpoint } from "./cdp/discovery";
+import { discoverEndpoint, type CdpEndpoint } from "./cdp/discovery";
 import { type CdpError, cdpError } from "./cdp/errors";
 import type { CdpTransport } from "./cdp/types";
 import { type CdpSession, createCdpSession } from "./cdp/session";
 import { type OwnershipRegistry, createOwnershipRegistry, reconcileOwnership } from "./cdp/ownership";
 import { ensureHarnessWindow, openHarnessTab } from "./cdp/target-factory";
-import { seedProfileWindow } from "./profile/bind";
+import { seedProfileWindow, type SeedDeps, verifyConnectedBrowserIdentity } from "./profile/bind";
 import type { ProfilePin } from "./profile/store";
 import type { DaemonStatus, DialogInfo, PageInfo, PageInfoResult, TabInfo } from "./cdp/types";
+
+export type ProfileContext =
+  | { readonly kind: "unresolved" }
+  | { readonly kind: "default" }
+  | { readonly kind: "named"; readonly contextId: string };
 
 export type BrowserClientOptions = {
   readonly namespace: string;
   readonly transport: CdpTransport;
-  readonly remote?: { readonly cdpUrl: string; readonly browserId: string };
+  readonly remote?: {
+    readonly cdpUrl: string;
+    readonly browserId: string;
+    readonly userDataDir?: string;
+  };
   readonly initialOwnership?: {
+    readonly namespace?: string;
+    readonly browserId?: string;
+    readonly userDataDir?: string;
+    readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string };
     readonly ownedTargetIds?: ReadonlyArray<string>;
     readonly harnessWindowTargetId?: string;
     readonly harnessWindowId?: number;
+    readonly profileContext?: ProfileContext;
+    readonly profileContextId?: string;
   };
   readonly profilePin?: ProfilePin | null;
   readonly onOwnershipChange?: (snapshot: {
+    readonly browserId?: string | undefined;
+    readonly userDataDir?: string | undefined;
+    readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string } | undefined;
     readonly ownedTargetIds: ReadonlyArray<string>;
     readonly harnessWindowTargetId: string | undefined;
     readonly harnessWindowId: number | undefined;
+    readonly profileContext?: ProfileContext | undefined;
   }) => void;
+  readonly seedDeps?: SeedDeps;
+  readonly discoverEndpoint?: () => Promise<Result<CdpEndpoint, CdpError>>;
 };
 
 export type BrowserClient = {
   readonly namespace: string;
+  browserId(): string | undefined;
+  latchedFailure(): CdpError | null;
   ensureAlive(): Promise<Result<void, CdpError>>;
   status(): DaemonStatus;
   // `reconnectNow` is for explicit human demand (/browser-setup, /browser-reload-daemon): it asks the
   // daemon to dial Chrome immediately even if it is cooling down after a failed attempt.
-  start(opts?: { readonly reconnectNow?: boolean }): Promise<Result<void, CdpError>>;
+  start(opts?: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean }): Promise<Result<void, CdpError>>;
   stop(): Promise<void>;
   detach(): Promise<void>;
   closeOwnedTabs(): Promise<void>;
@@ -56,9 +79,13 @@ export type BrowserClient = {
   transport(): CdpTransport;
   userDataDir(): string | undefined;
   profilePin(): ProfilePin | null;
+  profileGeneration(): number;
   setProfilePin(pin: ProfilePin | null): void;
+  profileContext(): ProfileContext;
+  setProfileContext(context: ProfileContext): void;
   profileContextId(): string | undefined;
   setProfileContextId(contextId: string | undefined): void;
+  verifyProfileIdentity(): Promise<Result<void, CdpError>>;
   seedPinnedProfileWindow(): Promise<Result<string, CdpError>>;
   mutationMutex(): Mutex;
 };
@@ -97,41 +124,95 @@ const parsePageInfoPayload = (raw: string): Result<PageInfo, CdpError> => {
   });
 };
 
+const samePin = (
+  a?: { readonly userDataDir: string; readonly profileDir: string } | null,
+  b?: ProfilePin | null,
+): boolean => {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.userDataDir === b.userDataDir && a.profileDir === b.profileDir;
+};
+
 export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient => {
   const transport = opts.transport;
+  const initialProvenanceValid =
+    opts.initialOwnership?.namespace === opts.namespace &&
+    opts.initialOwnership.browserId !== undefined &&
+    (opts.profilePin
+      ? opts.initialOwnership.profilePin !== undefined && samePin(opts.initialOwnership.profilePin, opts.profilePin)
+      : opts.initialOwnership.profilePin === undefined);
+
+  const init = initialProvenanceValid ? opts.initialOwnership : undefined;
   const ownershipInit: { ownedTargetIds?: ReadonlyArray<string>; harnessWindowTargetId?: string; harnessWindowId?: number } = {};
-  if (opts.initialOwnership?.ownedTargetIds !== undefined) {
-    ownershipInit.ownedTargetIds = opts.initialOwnership.ownedTargetIds;
+  if (init?.ownedTargetIds !== undefined) {
+    ownershipInit.ownedTargetIds = init.ownedTargetIds;
   }
-  if (opts.initialOwnership?.harnessWindowTargetId !== undefined) {
-    ownershipInit.harnessWindowTargetId = opts.initialOwnership.harnessWindowTargetId;
+  if (init?.harnessWindowTargetId !== undefined) {
+    ownershipInit.harnessWindowTargetId = init.harnessWindowTargetId;
   }
-  if (opts.initialOwnership?.harnessWindowId !== undefined) {
-    ownershipInit.harnessWindowId = opts.initialOwnership.harnessWindowId;
+  if (init?.harnessWindowId !== undefined) {
+    ownershipInit.harnessWindowId = init.harnessWindowId;
   }
   const ownership = createOwnershipRegistry(ownershipInit);
-  if (opts.onOwnershipChange) {
-    const cb = opts.onOwnershipChange;
-    ownership.onChange(() => {
-      cb({
+  let profileContext: ProfileContext = init?.profileContext
+    ?? (init?.profileContextId !== undefined
+      ? { kind: "named", contextId: init.profileContextId }
+      : { kind: "unresolved" });
+  let profileContextId: string | undefined = profileContext.kind === "named" ? profileContext.contextId : undefined;
+
+  const notifyOwnership = (): void => {
+    if (opts.onOwnershipChange) {
+      opts.onOwnershipChange({
+        browserId: remote?.browserId ?? opts.initialOwnership?.browserId,
+        userDataDir,
+        profilePin: profilePin
+          ? { userDataDir: profilePin.userDataDir, profileDir: profilePin.profileDir }
+          : undefined,
         ownedTargetIds: ownership.list(),
         harnessWindowTargetId: ownership.harnessWindow(),
         harnessWindowId: ownership.harnessWindowId(),
+        profileContext,
       });
-    });
+    }
+  };
+
+  if (opts.onOwnershipChange) {
+    ownership.onChange(notifyOwnership);
   }
   const session = createCdpSession(transport, ownership, async () => {
     const window = await ensureHarnessWindow(api);
     return window.success ? ok(window.data.targetId) : window;
-  });
+  }, () => pinGeneration);
   const mutationMutex = createMutex();
+  let latchedInitFailure: CdpError | null = null;
+  let inFlightInit: Promise<Result<void, CdpError>> | null = null;
+  let inExplicitRetry = false;
+  let pinGeneration = 0;
   let lastHealth = 0;
   let healthCheck: Promise<Result<void, CdpError>> | null = null;
   const pageCaches = new Map<string, { readonly info: PageInfo; readonly at: number }>();
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
   let userDataDir: string | undefined;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
-  let profileContextId: string | undefined;
+
+  transport.onClose(() => {
+    // Lost endpoint evidence invalidates in-flight profile work even when the pin is unchanged.
+    pinGeneration++;
+    userDataDir = undefined;
+    remote = null;
+  });
+
+  let registryProvenance: {
+    readonly namespace: string;
+    readonly browserId?: string | undefined;
+    readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string } | undefined;
+  } | null = init
+    ? {
+        namespace: opts.namespace,
+        browserId: init.browserId,
+        profilePin: init.profilePin,
+      }
+    : null;
 
   // With a pin set the window must exist BEFORE anything attaches, or attachFirstPage's bare Target.createTarget lands in the focus-derived default profile.
   const seedIfPinned = async (): Promise<Result<void, CdpError>> => {
@@ -141,50 +222,148 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     return ok(undefined);
   };
 
-  const start = async (opts: { readonly reconnectNow?: boolean } = {}): Promise<Result<void, CdpError>> => {
-    if (transport.state() === "open" && session.current()) return ok(undefined);
+  const doStart = async (
+    startOpts: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean } = {},
+  ): Promise<Result<void, CdpError>> => {
+    const currentPinGen = pinGeneration;
+    if (transport.state() === "open" && session.current()) {
+      latchedInitFailure = null;
+      return ok(undefined);
+    }
     let wsUrl: string;
-    if (remote?.cdpUrl) {
-      wsUrl = remote.cdpUrl;
+    if (opts.remote?.cdpUrl) {
+      wsUrl = opts.remote.cdpUrl;
     } else {
-      const discovered = await discoverEndpoint();
-      if (!discovered.success) return discovered;
+      const discover = opts.discoverEndpoint ?? discoverEndpoint;
+      const discovered = await discover();
+      if (!discovered.success) {
+        latchedInitFailure = discovered.error;
+        return discovered;
+      }
       wsUrl = discovered.data.wsUrl;
-      userDataDir = discovered.data.userDataDir;
     }
     const connected = await transport.connect(wsUrl, { timeoutMs: 10_000 });
-    if (!connected.success) return connected;
-    if (opts.reconnectNow) {
+    if (!connected.success) {
+      latchedInitFailure = connected.error;
+      return connected;
+    }
+    if (startOpts.reconnectNow) {
       // Only the daemon understands this; a direct Chrome transport answers "method not found",
       // which is fine because it has no cooldown to clear.
       const dialed = await transport.request(DAEMON_RECONNECT_METHOD, {}, { timeoutMs: 15_000 });
       if (!dialed.success && dialed.error.kind !== "remote_error") {
+        latchedInitFailure = dialed.error;
         await transport.close();
         return dialed;
       }
     }
 
-    const newBrowserId: string = wsUrl.split("/").pop() ?? "unknown";
-    if (remote?.browserId !== newBrowserId) {
-      profileContextId = undefined;
+    // Authoritative connected transport proof ONLY: constructor opts.remote must not authorize daemon spawn
+    const actual = transport.actualEndpoint?.();
+    let newBrowserId: string;
+    let transportUserDataDir: string | undefined;
+    if (actual) {
+      if (actual.wsUrl) wsUrl = actual.wsUrl;
+      transportUserDataDir = actual.userDataDir;
+      newBrowserId = actual.browserId ?? (actual.wsUrl ? actual.wsUrl.split("/").pop() ?? "unknown" : "unknown");
+    } else {
+      transportUserDataDir = undefined;
+      newBrowserId = "unknown";
     }
-    remote = { cdpUrl: wsUrl, browserId: newBrowserId };
+
+    userDataDir = transportUserDataDir;
+
+    if (registryProvenance !== null) {
+      const browserMatches = Boolean(
+        registryProvenance.browserId &&
+        registryProvenance.browserId === newBrowserId &&
+        newBrowserId !== "unknown",
+      );
+      const pinMatches =
+        profilePin !== null
+          ? registryProvenance.profilePin !== undefined && samePin(registryProvenance.profilePin, profilePin)
+          : registryProvenance.profilePin === undefined;
+      const namespaceMatches = registryProvenance.namespace === opts.namespace;
+
+      if (!browserMatches || !pinMatches || !namespaceMatches) {
+        profileContext = { kind: "unresolved" };
+        profileContextId = undefined;
+        ownership.replaceAll([]);
+        ownership.setHarnessWindow(undefined);
+        ownership.setHarnessWindowId(undefined);
+        registryProvenance = null;
+      }
+    }
+
+    if (pinGeneration !== currentPinGen) {
+      await transport.close();
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+
+    remote = { cdpUrl: wsUrl, browserId: newBrowserId, ...(userDataDir ? { userDataDir } : {}) };
     const seeded = await seedIfPinned();
     if (!seeded.success) {
+      latchedInitFailure = seeded.error;
       await transport.close();
       return seeded;
     }
+
+    if (pinGeneration !== currentPinGen) {
+      await transport.close();
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+
     const attached = await session.attachFirstPage();
     if (!attached.success) {
+      latchedInitFailure = attached.error;
       await transport.close();
       return attached;
     }
+
+    if (pinGeneration !== currentPinGen) {
+      await transport.close();
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+
+    registryProvenance = {
+      namespace: opts.namespace,
+      browserId: newBrowserId !== "unknown" ? newBrowserId : undefined,
+      profilePin: profilePin ? { userDataDir: profilePin.userDataDir, profileDir: profilePin.profileDir } : undefined,
+    };
+
+    latchedInitFailure = null;
     lastHealth = Date.now();
     pageCaches.clear();
     return ok(undefined);
   };
 
+  const start = (
+    opts: { readonly reconnectNow?: boolean; readonly retrySetup?: boolean } = {},
+  ): Promise<Result<void, CdpError>> => {
+    const isExplicit = Boolean(opts.reconnectNow ?? opts.retrySetup);
+    if (latchedInitFailure && !isExplicit) {
+      return Promise.resolve(err(latchedInitFailure));
+    }
+    if (inFlightInit) {
+      return inFlightInit;
+    }
+    const running = (async () => {
+      if (isExplicit) inExplicitRetry = true;
+      try {
+        const result = await doStart(opts);
+        if (!result.success) latchedInitFailure = result.error;
+        return result;
+      } finally {
+        inFlightInit = null;
+        inExplicitRetry = false;
+      }
+    })();
+    inFlightInit = running;
+    return running;
+  };
+
   const stop = async (): Promise<void> => {
+    await session.detachAll();
     await transport.close();
     pageCaches.clear();
     lastHealth = 0;
@@ -196,14 +375,34 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const reattach = async (): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
+    const myGen = pinGeneration;
     const seeded = await seedIfPinned();
-    if (!seeded.success) return seeded;
-    const reattached = await session.attachFirstPage();
-    if (reattached.success) {
-      pageCaches.clear();
-      return ok(undefined);
+    if (!seeded.success) {
+      latchedInitFailure = seeded.error;
+      await stop();
+      return seeded;
     }
-    return restart();
+    if (pinGeneration !== myGen) {
+      const genErr = cdpError("discovery_failed", "profile pin changed during initialization");
+      latchedInitFailure = genErr;
+      await stop();
+      return err(genErr);
+    }
+    const reattached = await session.attachFirstPage();
+    if (!reattached.success) {
+      latchedInitFailure = reattached.error;
+      return restart();
+    }
+    if (pinGeneration !== myGen) {
+      const genErr = cdpError("discovery_failed", "profile pin changed during initialization");
+      latchedInitFailure = genErr;
+      await stop();
+      return err(genErr);
+    }
+    latchedInitFailure = null;
+    pageCaches.clear();
+    return ok(undefined);
   };
 
   // Two probes: the browser one proves the socket works, the page one proves the current session does.
@@ -211,6 +410,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   // fails for a page-level reason (navigation in flight, a throwing page) still proves the session routes,
   // so it counts as alive; only a dead session id triggers a re-attach.
   const checkHealth = async (): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     if (transport.state() !== "open" || !session.current()) return restart();
     if (Date.now() - lastHealth < HEALTH_TTL_MS) return ok(undefined);
     const probe = await session.callBrowser("Target.getTargets", {}, { timeoutMs: 2_000 });
@@ -235,7 +435,9 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
   // Concurrent callers share one in-flight check, so two tools racing after a disconnect cannot both restart the transport.
   const ensureAlive = (): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return Promise.resolve(err(latchedInitFailure));
     if (healthCheck) return healthCheck;
+    if (inFlightInit) return inFlightInit;
     const running = checkHealth().finally(() => {
       healthCheck = null;
     });
@@ -244,6 +446,11 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const evaluateJs = async (expression: string, sessionId?: string): Promise<Result<unknown, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
+    if (!sessionId && !session.current()) {
+      const alive = await ensureAlive();
+      if (!alive.success) return alive;
+    }
     // Wrap only when the trimmed source *starts with* `return` — matching the substring anywhere silently turned expressions mentioning it into `undefined`.
     const trimmed = expression.trim();
     const isReturnStatement = /^return[\s(]/.test(trimmed);
@@ -259,6 +466,11 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const readPageInfo = async (): Promise<Result<PageInfo, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
+    if (!session.current()) {
+      const alive = await ensureAlive();
+      if (!alive.success) return alive;
+    }
     const dirty = session.drainPageInfoInvalidations();
     const currentTid = session.current()?.targetId;
     const cached = currentTid ? pageCaches.get(currentTid) : undefined;
@@ -274,6 +486,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const pageInfo = async (): Promise<Result<PageInfoResult, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const d = session.takeDialog();
     if (d) return ok({ kind: "dialog", dialog: d });
     const info = await readPageInfo();
@@ -282,6 +495,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const listTabs = async (includeInternal = true): Promise<Result<ReadonlyArray<TabInfo>, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const r = await session.callBrowser("Target.getTargets");
     if (!r.success) return r;
     const tabs = r.data.targetInfos
@@ -302,6 +516,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const switchTab = async (targetId: string): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const r = await session.switchTo(targetId);
     if (!r.success) return r;
     await session.call("Runtime.evaluate", {
@@ -311,6 +526,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const newTab = async (url?: string): Promise<Result<string, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     // ensureHarnessWindow lists live targets and reconciles ownership itself, so no listing is needed here.
     const window = await ensureHarnessWindow(api);
     if (!window.success) return window;
@@ -333,6 +549,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const closeTab = async (targetId: string): Promise<Result<void, CdpError>> => {
+    if (latchedInitFailure) return err(latchedInitFailure);
     const r = await session.callBrowser("Target.closeTarget", { targetId });
     if (!r.success) return r;
     ownership.remove(targetId);
@@ -350,7 +567,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   };
 
   const status = (): DaemonStatus => ({
-    alive: transport.state() === "open" && session.current() !== null,
+    alive: transport.state() === "open" && session.current() !== null && latchedInitFailure === null,
     sessionId: session.current()?.sessionId ?? null,
     namespace: opts.namespace,
     ...(remote?.browserId !== undefined ? { remoteBrowserId: remote.browserId } : {}),
@@ -374,26 +591,67 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     transport: () => transport,
     userDataDir: () => userDataDir,
     profilePin: () => profilePin,
+    profileGeneration: () => pinGeneration,
     setProfilePin: (pin) => {
-      const changed = pin === null
-        ? profilePin !== null
-        : profilePin?.userDataDir !== pin.userDataDir || profilePin.profileDir !== pin.profileDir;
+      const changed = !samePin(profilePin, pin);
       profilePin = pin;
       if (changed) {
+        pinGeneration++;
+        ownership.replaceAll([]);
+        ownership.setHarnessWindow(undefined);
+        ownership.setHarnessWindowId(undefined);
+        profileContext = { kind: "unresolved" };
         profileContextId = undefined;
+        registryProvenance = null;
+        pageCaches.clear();
+        lastHealth = 0;
+        void detach();
+        notifyOwnership();
       }
+    },
+    profileContext: () => profileContext,
+    setProfileContext: (ctx) => {
+      profileContext = ctx;
+      profileContextId = ctx.kind === "named" ? ctx.contextId : undefined;
+      notifyOwnership();
     },
     profileContextId: () => profileContextId,
     setProfileContextId: (contextId) => {
-      profileContextId = contextId;
+      if (contextId !== undefined) {
+        profileContext = { kind: "named", contextId };
+        profileContextId = contextId;
+      } else {
+        profileContext = { kind: "unresolved" };
+        profileContextId = undefined;
+      }
+      notifyOwnership();
+    },
+    verifyProfileIdentity: async () => {
+      if (!profilePin) return ok(undefined);
+      const verified = await verifyConnectedBrowserIdentity(api, profilePin, opts.seedDeps);
+      if (!verified.success) return verified;
+      return ok(undefined);
     },
     seedPinnedProfileWindow: async () => {
+      if (latchedInitFailure && !inExplicitRetry) return err(latchedInitFailure);
       if (!profilePin) {
         return err(cdpError("discovery_failed", "no browser profile is selected — run /browser-profile"));
       }
-      return seedProfileWindow(api, profilePin);
+      const myGen = pinGeneration;
+      const r = await seedProfileWindow(api, profilePin, opts.seedDeps, () => pinGeneration === myGen);
+      if (pinGeneration !== myGen) {
+        const genErr = cdpError("discovery_failed", "profile pin changed during initialization");
+        latchedInitFailure = genErr;
+        return err(genErr);
+      }
+      if (!r.success) {
+        latchedInitFailure = r.error;
+      }
+      return r;
     },
     mutationMutex: () => mutationMutex,
+    browserId: () => remote?.browserId ?? opts.initialOwnership?.browserId,
+    latchedFailure: () => latchedInitFailure,
   };
   return api;
 };

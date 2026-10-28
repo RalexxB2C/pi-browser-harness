@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { BrowserClient } from "./client";
 import { ensureDaemon } from "./daemon/spawn";
-import { DAEMON_SOCKET_PATH } from "./daemon/protocol";
+import { daemonSocketPath } from "./daemon/protocol";
 import { isBrowserRunning } from "./profile/browser-process";
 import { promptForProfileIfUnset } from "./profile/command";
 import { type Result, err, ok } from "./util/result";
@@ -40,34 +40,14 @@ export async function performSetup(
 
   const daemonReady = await (deps.ensureDaemon ?? ensureDaemon)();
   if (!daemonReady) {
-    return err(`Could not start the browser daemon. Check ${DAEMON_SOCKET_PATH}.`);
+    return err(`Could not start the browser daemon. Check ${daemonSocketPath()}.`);
   }
 
   const profileNote = await promptForProfileIfUnset(client, ctx);
 
   const startResult = await client.start({ reconnectNow: true });
   if (!startResult.success) {
-    const msg = startResult.error.message;
-    const lower = msg.toLowerCase();
-
-    if (
-      lower.includes("devtoolsactiveport") ||
-      lower.includes("remote debugging") ||
-      lower.includes("econnrefused") ||
-      lower.includes("cannot reach chrome devtools")
-    ) {
-      return err(
-        "Browser remote debugging needs to be enabled.\n\n" +
-          "Open chrome://inspect/#remote-debugging (or brave://inspect,\n" +
-          "edge://inspect) in your browser, tick the\n" +
-          '"Discover network targets" / Allow checkbox, then retry.\n\n' +
-          "If that doesn't expose DevTools, relaunch the browser with\n" +
-          "--remote-debugging-port=9222.\n\n" +
-          "Or set BU_CDP_WS to a remote browser WebSocket URL.",
-      );
-    }
-
-    return err(`Connection failed: ${msg}`);
+    return err(`Connection failed (${startResult.error.kind}): ${startResult.error.message}`);
   }
 
   const tabResult = await client.newTab("https://github.com");

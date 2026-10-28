@@ -1,6 +1,9 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { endpointFromEnv, firstReadyPort, parseVersionResponse, type PortProbe } from "../../src/cdp/discovery";
+import { endpointFromEnv, firstReadyPort, parseVersionResponse, discoverEndpoint, type PortProbe } from "../../src/cdp/discovery";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { err, ok } from "../../src/util/result";
 import { cdpError } from "../../src/cdp/errors";
 
@@ -84,5 +87,49 @@ describe("firstReadyPort", () => {
   test("no candidates is an immediate failure", async () => {
     const r = await firstReadyPort([], { probe: live(1), deadlineMs: 1_000 });
     assert.equal(r.success, false);
+  });
+});
+
+describe("discoverEndpoint browser-path linkage verification", () => {
+  let tempDir: string;
+
+  test("R3: rejects userDataDir linkage when live WebSocket path mismatches DevToolsActivePort path", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "pi-disc-link-"));
+    const portFilePath = "/devtools/browser/old-browser-guid";
+    writeFileSync(join(tempDir, "DevToolsActivePort"), `9222\n${portFilePath}\n`);
+
+    try {
+      const res = await discoverEndpoint({
+        userDataDirCandidates: () => [tempDir],
+        isPortLive: () => Promise.resolve(true),
+        queryLiveWsUrl: () => Promise.resolve("ws://127.0.0.1:9222/devtools/browser/foreign-live-guid"),
+      });
+
+      assert.equal(res.success, true);
+      assert.equal(res.data.wsUrl, "ws://127.0.0.1:9222/devtools/browser/foreign-live-guid");
+      assert.equal(res.data.userDataDir, undefined, "mismatched secret path must reject directory linkage");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  test("R3: preserves userDataDir linkage when live WebSocket path matches DevToolsActivePort path", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "pi-disc-link-"));
+    const portFilePath = "/devtools/browser/matching-guid";
+    writeFileSync(join(tempDir, "DevToolsActivePort"), `9222\n${portFilePath}\n`);
+
+    try {
+      const res = await discoverEndpoint({
+        userDataDirCandidates: () => [tempDir],
+        isPortLive: () => Promise.resolve(true),
+        queryLiveWsUrl: () => Promise.resolve(`ws://127.0.0.1:9222${portFilePath}`),
+      });
+
+      assert.equal(res.success, true);
+      assert.equal(res.data.wsUrl, `ws://127.0.0.1:9222${portFilePath}`);
+      assert.equal(res.data.userDataDir, tempDir, "matching secret path confirms directory linkage");
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

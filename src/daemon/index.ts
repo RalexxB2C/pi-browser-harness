@@ -28,14 +28,19 @@ export const describeError = (e: unknown): string => (e instanceof Error ? (e.st
 // idle timer and shutdown. Every collaborator is injectable so the wiring can be driven in-process.
 // The process entry that starts it lives in ./main.ts, so importing this module never launches a daemon.
 export const createDaemon = (deps: DaemonDeps = {}): Daemon => {
-  const ipcServer = deps.ipcServer ?? createIpcServer();
   const cdpBridge = deps.cdpBridge ?? createCdpBridge();
+  const ipcServer = deps.ipcServer ?? createIpcServer({
+    provenance: () => cdpBridge.provenance(),
+    awaitReady: () => cdpBridge.awaitReady(),
+  });
   const idleTimeoutMs = deps.idleTimeoutMs ?? DAEMON_IDLE_TIMEOUT_MS;
   const exit = deps.exit ?? ((code: number): void => { process.exit(code); });
   const log = deps.log ?? ((line: string): void => { console.log(`${LOG_PREFIX} ${line}`); });
 
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let stopping: Promise<void> | null = null;
+  const registeredClients = new Set<string>();
+  const staleClients = new Set<string>();
 
   const cancelIdleTimer = (): void => {
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
@@ -66,6 +71,10 @@ export const createDaemon = (deps: DaemonDeps = {}): Daemon => {
   ipcServer.onMessage((msg, client) => {
     // Control messages (register/deregister) are consumed by the server itself.
     if (msg.type !== "request") return;
+    if (staleClients.has(client.id)) {
+      ipcServer.send(client.id, { type: "response", id: msg.id, error: { code: -1, message: "Chrome connection changed; reconnect the client before retrying" } });
+      return;
+    }
 
     const send: SendToClient = (cid, resp) => {
       ipcServer.send(cid, resp);
@@ -81,10 +90,13 @@ export const createDaemon = (deps: DaemonDeps = {}): Daemon => {
   });
 
   ipcServer.onDisconnect((client) => {
+    registeredClients.delete(client.id);
+    staleClients.delete(client.id);
     cdpBridge.removeClient(client.id);
   });
 
   cdpBridge.onClose(() => {
+    for (const id of registeredClients) staleClients.add(id);
     log("Chrome disconnected");
     ipcServer.broadcast({
       type: "control",
@@ -93,7 +105,11 @@ export const createDaemon = (deps: DaemonDeps = {}): Daemon => {
     });
   });
 
-  ipcServer.onConnect(() => { cancelIdleTimer(); });
+  ipcServer.onConnect((client) => {
+    registeredClients.add(client.id);
+    staleClients.delete(client.id);
+    cancelIdleTimer();
+  });
   ipcServer.onDisconnect(() => { resetIdleTimer(); });
 
   const start = async (): Promise<void> => {

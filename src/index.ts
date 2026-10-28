@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { type BrowserClient, type BrowserClientOptions, createBrowserClient } from "./client";
+import { type BrowserClient, type BrowserClientOptions, type ProfileContext, createBrowserClient } from "./client";
+import type { SeedDeps } from "./profile/bind";
 import { getBrowserSystemPrompt } from "./prompt";
 import { registerSetupCommand } from "./setup";
 import { registerProfileCommand } from "./profile/command";
@@ -10,6 +11,8 @@ import { cleanupTempDirs } from "./util/truncate";
 import { restoreDownloadBehavior } from "./domains/files";
 import { createDaemonTransport } from "./daemon/transport";
 import type { CdpTransport } from "./cdp/types";
+import type { CdpEndpoint } from "./cdp/discovery";
+import type { CdpError } from "./cdp/errors";
 import { setDebugClicks } from "./util/debug";
 import { asBoolean, asString } from "./util/guards";
 import type { BrowserTool } from "./util/tool";
@@ -53,6 +56,8 @@ export type ExtensionDeps = {
   readonly createTransport?: (namespace: string) => CdpTransport;
   readonly createClient?: (opts: BrowserClientOptions) => BrowserClient;
   readonly readPin?: () => Promise<ProfilePin | null>;
+  readonly seedDeps?: SeedDeps;
+  readonly discoverEndpoint?: () => Promise<Result<CdpEndpoint, CdpError>>;
 };
 
 export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) => void) => (pi: ExtensionAPI): void => {
@@ -146,25 +151,48 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
     if (!client) {
       const transport = createTransport(restored.namespace);
 
-      const initialOwnership: { ownedTargetIds?: ReadonlyArray<string>; harnessWindowTargetId?: string; harnessWindowId?: number } = {};
+      const initialOwnership: {
+        namespace?: string;
+        browserId?: string;
+        userDataDir?: string;
+        profilePin?: { userDataDir: string; profileDir: string };
+        ownedTargetIds?: ReadonlyArray<string>;
+        harnessWindowTargetId?: string;
+        harnessWindowId?: number;
+        profileContext?: ProfileContext;
+      } = {
+        namespace: restored.namespace,
+      };
+      if (restored.browserId !== undefined) initialOwnership.browserId = restored.browserId;
+      if (restored.userDataDir !== undefined) initialOwnership.userDataDir = restored.userDataDir;
+      if (restored.profilePin !== undefined) initialOwnership.profilePin = restored.profilePin;
       if (restored.ownedTargetIds !== undefined) initialOwnership.ownedTargetIds = restored.ownedTargetIds;
       if (restored.harnessWindowTargetId !== undefined) initialOwnership.harnessWindowTargetId = restored.harnessWindowTargetId;
       if (restored.harnessWindowId !== undefined) initialOwnership.harnessWindowId = restored.harnessWindowId;
+      if (restored.profileContext !== undefined) initialOwnership.profileContext = restored.profileContext;
 
       client = createClient({
         namespace: restored.namespace,
         transport,
         profilePin,
+        ...(deps.discoverEndpoint ? { discoverEndpoint: deps.discoverEndpoint } : {}),
+        ...(deps.seedDeps ? { seedDeps: deps.seedDeps } : {}),
         ...(Object.keys(initialOwnership).length > 0 ? { initialOwnership } : {}),
         onOwnershipChange: (snap) => {
           state = {
-            ...(state ?? restored),
+            namespace: restored.namespace,
             ownedTargetIds: snap.ownedTargetIds,
+            ...(snap.browserId !== undefined ? { browserId: snap.browserId } : {}),
+            ...(snap.userDataDir !== undefined ? { userDataDir: snap.userDataDir } : {}),
+            ...(snap.profilePin !== undefined ? { profilePin: snap.profilePin } : {}),
             ...(snap.harnessWindowTargetId !== undefined
               ? { harnessWindowTargetId: snap.harnessWindowTargetId }
               : {}),
             ...(snap.harnessWindowId !== undefined
               ? { harnessWindowId: snap.harnessWindowId }
+              : {}),
+            ...(snap.profileContext !== undefined
+              ? { profileContext: snap.profileContext }
               : {}),
           };
           try {

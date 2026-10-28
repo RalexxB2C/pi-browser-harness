@@ -2,12 +2,14 @@ import { createConnection, type Socket } from "node:net";
 import { readLines } from "./lines";
 import { destroyQuietly } from "./socket";
 import { type Result, err, ok } from "../util/result";
+import { isRecord } from "../util/guards";
 import { type CdpError, cdpError, classifyRemoteError } from "../cdp/errors";
 import { DEFAULT_TIMEOUT_MS, type CdpTransport } from "../cdp/types";
 import type { CdpEvent } from "../cdp/types";
 import { type Pending, makeEventQueue, makeOnClose, rejectAllPending, sendWithTimeout } from "./queue";
 import {
-  DAEMON_SOCKET_PATH,
+  DAEMON_RECONNECT_METHOD,
+  daemonSocketPath,
   type WireRequest,
   type WireControl,
   deserialize,
@@ -16,13 +18,14 @@ import {
 
 type ConnectResult = Result<void, CdpError>;
 
-export const createDaemonTransport = (clientId: string, socketPath: string = DAEMON_SOCKET_PATH): CdpTransport => {
+export const createDaemonTransport = (clientId: string, socketPath: string = daemonSocketPath()): CdpTransport => {
   let socket: Socket | null = null;
   let stopReading: (() => void) | null = null;
   let queue = makeEventQueue();
   const closeListeners = new Set<() => void>();
   const pending = new Map<number, Pending>();
   let registered = false;
+  let actualEndpointInfo: { readonly wsUrl?: string; readonly browserId?: string; readonly userDataDir?: string } | undefined;
   let nextRequestId = 1;
   // The handshake in progress, so that concurrent connect() callers share one socket instead
   // of each opening their own and the later one orphaning the earlier.
@@ -40,6 +43,7 @@ export const createDaemonTransport = (clientId: string, socketPath: string = DAE
     queue.end();
     queue = makeEventQueue();
     registered = false;
+    actualEndpointInfo = undefined;
 
     if (stopReading) { stopReading(); stopReading = null; }
     socket = null;
@@ -88,6 +92,13 @@ export const createDaemonTransport = (clientId: string, socketPath: string = DAE
           if (msg.type === "control") {
             if (msg.action === "registered" && msg.clientId === clientId) {
               registered = true;
+              actualEndpointInfo = (msg.browserId !== undefined || msg.userDataDir !== undefined || msg.cdpUrl !== undefined)
+                ? {
+                    ...(msg.browserId !== undefined ? { browserId: msg.browserId } : {}),
+                    ...(msg.userDataDir !== undefined ? { userDataDir: msg.userDataDir } : {}),
+                    ...(msg.cdpUrl !== undefined ? { wsUrl: msg.cdpUrl } : {}),
+                  }
+                : undefined;
               settle(ok(undefined));
             } else if (msg.action === "shutdown") {
               cleanup(sock, `Daemon shutting down: ${msg.reason ?? "unknown"}`);
@@ -107,6 +118,23 @@ export const createDaemonTransport = (clientId: string, socketPath: string = DAE
             if (msg.error) {
               p.resolve(err(cdpError(classifyRemoteError(msg.error.message), msg.error.message, p.method)));
             } else {
+              if (p.method === DAEMON_RECONNECT_METHOD) {
+                if (isRecord(msg.result)) {
+                  const res = msg.result;
+                  const bId = typeof res["browserId"] === "string" ? res["browserId"] : undefined;
+                  const uDir = typeof res["userDataDir"] === "string" ? res["userDataDir"] : undefined;
+                  const cUrl = typeof res["cdpUrl"] === "string" ? res["cdpUrl"] : undefined;
+                  actualEndpointInfo = (bId !== undefined || uDir !== undefined || cUrl !== undefined)
+                    ? {
+                        ...(bId !== undefined ? { browserId: bId } : {}),
+                        ...(uDir !== undefined ? { userDataDir: uDir } : {}),
+                        ...(cUrl !== undefined ? { wsUrl: cUrl } : {}),
+                      }
+                    : undefined;
+                } else {
+                  actualEndpointInfo = undefined;
+                }
+              }
               p.resolve(ok(msg.result));
             }
             return;
@@ -210,5 +238,5 @@ export const createDaemonTransport = (clientId: string, socketPath: string = DAE
 
   const onClose = makeOnClose(closeListeners);
 
-  return { connect, close, request, events, state, onClose };
+  return { connect, close, request, events, state, onClose, actualEndpoint: () => actualEndpointInfo };
 };

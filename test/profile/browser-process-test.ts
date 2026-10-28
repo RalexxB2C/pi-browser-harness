@@ -1,18 +1,49 @@
 import { test, before, after, describe } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { homedir, hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   isLinuxBrowserComm,
+  linuxProfileOwnerPid,
   parseProcCmdline,
   parseUserDataDirFlag,
   rankBrowserCandidate,
   resolveBrowserExecutable,
+  selectBrowserCandidate,
   spawnableExePath,
   stripDeletedSuffix,
   userDataDirFromArgv,
+  type BrowserCandidate,
 } from "../../src/profile/browser-process";
+
+test("Linux profile identity requires the local lock PID to own its listening singleton socket", { skip: process.platform !== "linux" }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "harness-owner-"));
+  const socket = join(dir, "socket");
+  const lock = join(dir, "SingletonLock");
+  const socketLink = join(dir, "SingletonSocket");
+  const server = createServer();
+  t.after(async () => {
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socket, resolve));
+  symlinkSync(socket, socketLink);
+  symlinkSync(`${hostname()}-${process.pid}`, lock);
+  assert.equal(await linuxProfileOwnerPid(dir), String(process.pid));
+
+  unlinkSync(lock);
+  symlinkSync(`${hostname()}-${process.ppid}`, lock);
+  assert.equal(await linuxProfileOwnerPid(dir), undefined, "a live PID not owning the socket is insufficient");
+  unlinkSync(lock);
+  symlinkSync(`other-host-${process.pid}`, lock);
+  assert.equal(await linuxProfileOwnerPid(dir), undefined, "a remote host lock cannot identify a local browser");
+  unlinkSync(lock);
+  symlinkSync(`${hostname()}-${process.pid}`, lock);
+  await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+  assert.equal(await linuxProfileOwnerPid(dir), undefined, "a stale lock/socket link is insufficient");
+});
 
 describe("browser-process parsing and candidate ranking", () => {
   test("B1: bare value parsed", () => {
@@ -70,6 +101,119 @@ describe("browser-process parsing and candidate ranking", () => {
   test("B9: an absent or empty --user-data-dir reads as undefined", () => {
     assert.equal(userDataDirFromArgv(["/usr/bin/chrome"]), undefined);
     assert.equal(userDataDirFromArgv(["/usr/bin/chrome", "--user-data-dir="]), undefined);
+  });
+
+  test("B9: recognizes an explicit user-data-dir in a rewritten process-title command line", () => {
+    const raw = "/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=/home/u/.config/google-chrome\0";
+    const argv = parseProcCmdline(raw);
+    assert.equal(userDataDirFromArgv(argv), "/home/u/.config/google-chrome");
+  });
+
+  describe("selectBrowserCandidate identity verification", () => {
+    const targetDir = "/home/u/.config/google-chrome";
+    const chromeExe = "/opt/google/chrome/chrome";
+    const cftExe = "/home/u/.agent-browser/browsers/chrome-150.0.7871.115/chrome";
+
+    test("ambiguous zero-spawn: [Chrome, CFT] candidate order with absent flags", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: chromeExe },
+        { exePath: cftExe },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, true);
+      assert.equal(result.exePath, undefined);
+      assert.match(result.error ?? "", /ambiguous/i);
+    });
+
+    test("ambiguous zero-spawn: [CFT, Chrome] candidate order with absent flags", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: cftExe },
+        { exePath: chromeExe },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, true);
+      assert.equal(result.exePath, undefined);
+      assert.match(result.error ?? "", /ambiguous/i);
+    });
+
+    test("ambiguous zero-spawn: sole candidate (e.g. CFT) lacking explicit user-data-dir flag is rejected as ambiguous", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: cftExe },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, true);
+      assert.equal(result.exePath, undefined);
+      assert.match(result.error ?? "", /ambiguous browser identity/i);
+    });
+
+    test("kernel-verified profile owner outranks flagless CFT without inventing an explicit flag", () => {
+      const owner: BrowserCandidate = { exePath: chromeExe, verifiedUserDataDir: targetDir };
+      for (const candidates of [[owner, { exePath: cftExe }], [{ exePath: cftExe }, owner]]) {
+        const result = selectBrowserCandidate(candidates, targetDir);
+        assert.equal(result.ambiguous, undefined);
+        assert.equal(result.exePath, chromeExe);
+        assert.equal(result.verifiedUserDataDir, targetDir);
+        assert.equal(result.explicitUserDataDir, undefined);
+      }
+      assert.equal(selectBrowserCandidate([owner], "/tmp/other-profile").exePath, undefined);
+      assert.equal(selectBrowserCandidate([{ ...owner, explicitUserDataDir: "/tmp/other-profile" }], targetDir).exePath, undefined);
+    });
+
+    test("verified positive identity: ordinary explicit flag on Chrome outranks absent CFT in both orders", () => {
+      const chromeExplicit: BrowserCandidate = { exePath: chromeExe, explicitUserDataDir: targetDir };
+      const cftAbsent: BrowserCandidate = { exePath: cftExe };
+
+      const order1 = selectBrowserCandidate([chromeExplicit, cftAbsent], targetDir);
+      assert.equal(order1.running, true);
+      assert.equal(order1.ambiguous, undefined);
+      assert.equal(order1.exePath, chromeExe);
+      assert.equal(order1.explicitUserDataDir, targetDir);
+
+      const order2 = selectBrowserCandidate([cftAbsent, chromeExplicit], targetDir);
+      assert.equal(order2.running, true);
+      assert.equal(order2.ambiguous, undefined);
+      assert.equal(order2.exePath, chromeExe);
+      assert.equal(order2.explicitUserDataDir, targetDir);
+    });
+
+    test("verified positive identity: rewritten explicit flag parsed from argv", () => {
+      const argv = parseProcCmdline(`${chromeExe} --user-data-dir=${targetDir}\0`);
+      const explicit = userDataDirFromArgv(argv);
+      assert.equal(explicit, targetDir);
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: cftExe },
+        { exePath: chromeExe, explicitUserDataDir: explicit },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, undefined);
+      assert.equal(result.exePath, chromeExe);
+      assert.equal(result.explicitUserDataDir, targetDir);
+    });
+
+    test("mismatches: candidate with different explicit user-data-dir is rejected", () => {
+      const otherDir = "/home/u/.config/BraveSoftware/Brave-Browser";
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: "/usr/bin/brave-browser", explicitUserDataDir: otherDir },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, false);
+      assert.equal(result.exePath, undefined);
+    });
+
+    test("verified positive identity: single candidate uniquely matching target without rivals", () => {
+      const candidates: ReadonlyArray<BrowserCandidate> = [
+        { exePath: chromeExe, explicitUserDataDir: targetDir },
+      ];
+      const result = selectBrowserCandidate(candidates, targetDir);
+      assert.equal(result.running, true);
+      assert.equal(result.ambiguous, undefined);
+      assert.equal(result.exePath, chromeExe);
+      assert.equal(result.explicitUserDataDir, targetDir);
+    });
   });
 
   test("B2: exact user-data-dir match outranks a flagless process", () => {
@@ -189,13 +333,9 @@ describe("browser-process parsing and candidate ranking", () => {
       assert.equal(await resolveBrowserExecutable({ running: true, exePath: `${real} (deleted)` }), real);
     });
 
-    test(
-      "B7: an unspawnable path is not passed on as usable",
-      { skip: process.platform === "win32" },
-      async () => {
-        assert.equal(await resolveBrowserExecutable({ running: true, exePath: join(root, "absent") }), undefined);
-      },
-    );
+    test("B7: an unspawnable running path is not passed on as usable on any platform", async () => {
+      assert.equal(await resolveBrowserExecutable({ running: true, exePath: join(root, "absent") }), undefined);
+    });
 
     // A binary genuinely named "… (deleted)" must win over the stripped form; created last so the checks above see only the ordinary case.
     test("B7: a real file named '… (deleted)' is preferred over stripping", async () => {

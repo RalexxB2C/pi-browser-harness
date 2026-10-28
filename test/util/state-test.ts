@@ -1,8 +1,9 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { type BrowserState, createStatePersister, defaultState } from "../../src/state";
+import { type BrowserState, createStatePersister, defaultState, restoreState } from "../../src/state";
 import { isRecord } from "../../src/util/guards";
+import { fakeCtx } from "../helpers/fake-pi";
 
 // Pi session JSONL is append-only, so every appendEntry is permanent. Issue #26: identical
 // snapshots were appended on every ownership callback, session_tree and shutdown, growing the
@@ -77,5 +78,74 @@ describe("state persister", () => {
     assert.equal(persister.persist(defaultState()), true);
     assert.equal(persister.persist(defaultState()), false);
     assert.equal(entries.length, 1);
+  });
+});
+
+describe("restoreState namespace boundaries", () => {
+  test("R5: state without namespace is rejected and returns fallback with empty ownership", () => {
+    const ctx = fakeCtx({
+      branch: [
+        {
+          type: "custom",
+          customType: "browser-harness-state",
+          data: {
+            // Missing namespace!
+            ownedTargetIds: ["unnamespaced-tab"],
+            harnessWindowTargetId: "unnamespaced-tab",
+            harnessWindowId: 10,
+          },
+        },
+      ],
+    });
+
+    const restored = restoreState(ctx.ctx, "current-namespace");
+    assert.equal(restored.namespace, "current-namespace");
+    assert.deepEqual(restored.ownedTargetIds, [], "ownership must be empty when namespace was missing");
+    assert.equal(restored.harnessWindowTargetId, undefined);
+    assert.equal(restored.harnessWindowId, undefined);
+  });
+
+  test("R5: state with mismatched namespace is rejected and returns fallback", () => {
+    const ctx = fakeCtx({
+      branch: [
+        {
+          type: "custom",
+          customType: "browser-harness-state",
+          data: {
+            namespace: "team-A",
+            ownedTargetIds: ["tab-A"],
+            harnessWindowTargetId: "tab-A",
+          },
+        },
+      ],
+    });
+
+    const restored = restoreState(ctx.ctx, "team-B");
+    assert.equal(restored.namespace, "team-B");
+    assert.deepEqual(restored.ownedTargetIds, [], "ownership must be empty on namespace mismatch");
+    assert.equal(restored.harnessWindowTargetId, undefined);
+  });
+
+  test("R5: state with matching namespace is restored with ownership intact", () => {
+    const ctx = fakeCtx({
+      branch: [
+        {
+          type: "custom",
+          customType: "browser-harness-state",
+          data: {
+            namespace: "team-match",
+            ownedTargetIds: ["tab-match"],
+            harnessWindowTargetId: "tab-match",
+            harnessWindowId: 77,
+          },
+        },
+      ],
+    });
+
+    const restored = restoreState(ctx.ctx, "team-match");
+    assert.equal(restored.namespace, "team-match");
+    assert.deepEqual(restored.ownedTargetIds, ["tab-match"]);
+    assert.equal(restored.harnessWindowTargetId, "tab-match");
+    assert.equal(restored.harnessWindowId, 77);
   });
 });

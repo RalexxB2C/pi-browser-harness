@@ -41,6 +41,8 @@ export type CdpBridge = {
   readonly onEvent: (handler: EventHandler) => void;
   // Fires when an established Chrome connection drops; never for an attempt that failed to open.
   readonly onClose: (handler: CloseHandler) => void;
+  readonly provenance: () => { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
+  readonly awaitReady: () => Promise<boolean>;
 };
 
 export type InFlight = {
@@ -204,7 +206,7 @@ export const createCdpBridge = (options: ChromeConnectionDependencies = {}): Cdp
       // Requests that went out on this socket can never be answered now; fail them at once
       // rather than leaving them to the command timeout.
       failAll(mux.takeWhere((e) => e.generation === generation), "Chrome disconnected");
-      if (reason === "dropped") closeHandler?.();
+      if (reason === "dropped" || reason === "superseded") closeHandler?.();
     },
   });
 
@@ -229,14 +231,30 @@ export const createCdpBridge = (options: ChromeConnectionDependencies = {}): Cdp
     // The one request the daemon answers itself: a human asked for a fresh dial.
     if (req.method === DAEMON_RECONNECT_METHOD) {
       const open = await connection.reconnectNow();
+      const prov = open ? connection.provenance() : undefined;
       send(clientId, open
-        ? { type: "response", id: req.id, result: { connected: true } }
+        ? {
+            type: "response",
+            id: req.id,
+            result: {
+              connected: true,
+              ...(prov?.browserId !== undefined ? { browserId: prov.browserId } : {}),
+              ...(prov?.userDataDir !== undefined ? { userDataDir: prov.userDataDir } : {}),
+              ...(prov?.cdpUrl !== undefined ? { cdpUrl: prov.cdpUrl } : {}),
+            },
+          }
         : errorResponse(req.id, describeDisconnected(connection.status())));
       return;
     }
+    const requestedGeneration = connection.generation();
     // Connection attempts happen only in response to explicit browser work.
     if (!connection.isOpen() && !(await connection.connect())) {
       send(clientId, errorResponse(req.id, describeDisconnected(connection.status())));
+      return;
+    }
+
+    if (requestedGeneration !== 0 && requestedGeneration !== connection.generation()) {
+      send(clientId, errorResponse(req.id, "Chrome connection changed; reconnect the client before retrying"));
       return;
     }
 
@@ -288,5 +306,10 @@ export const createCdpBridge = (options: ChromeConnectionDependencies = {}): Cdp
     },
     onEvent: (h) => { eventHandler = h; },
     onClose: (h) => { closeHandler = h; },
+    provenance: () => connection.provenance(),
+    awaitReady: async (): Promise<boolean> => {
+      if (connection.isOpen()) return true;
+      return connection.connect();
+    },
   };
 };

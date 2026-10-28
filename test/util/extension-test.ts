@@ -1,17 +1,24 @@
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { createServer, type Server, type Socket } from "node:net";
+import { createInterface } from "node:readline";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_MAX_LINES } from "@mariozechner/pi-coding-agent";
 import browserHarnessExtension, { createExtension } from "../../src/index";
-import type { BrowserClient, BrowserClientOptions } from "../../src/client";
+import type { BrowserClient, BrowserClientOptions, ProfileContext } from "../../src/client";
 import type { ProfilePin } from "../../src/profile/store";
 import { ALL_TOOLS } from "../../src/registry";
 import { applyTruncation } from "../../src/util/truncate";
 import { asString, isRecord } from "../../src/util/guards";
 import { createFakeClient, createStubTransport } from "../domains/fake-client";
 import { fakeCtx, fakePi } from "../helpers/fake-pi";
+import type { ProfileWindowRequest } from "../../src/profile/launch";
+import type { SeedDeps } from "../../src/profile/bind";
+import { ok } from "../../src/util/result";
+import { createDaemonTransport } from "../../src/daemon/transport";
+import { DAEMON_RECONNECT_METHOD, deserialize, serialize, type WireControl, type WireRequest } from "../../src/daemon/protocol";
 
 // test/domains/extension-registration-test.ts covers the third-party tool seam and that contributed
 // tools reach pi on session_start. This file covers the extension's own wiring: flags, commands,
@@ -27,6 +34,46 @@ const load = () => {
   browserHarnessExtension(pi.pi);
   return pi;
 };
+
+const SKIP_SOCKET = process.platform === "win32" ? "daemon uses named pipe on win32" : false;
+
+const createIsolatedDaemon = (
+  onRegister: (conn: Socket, clientId: string) => void,
+  onRequest: (conn: Socket, msg: WireRequest) => void = (conn, msg) => {
+    conn.write(serialize({ type: "response", id: msg.id, result: {} }) + "\n");
+  },
+): Promise<{ readonly socketPath: string; readonly dispose: () => Promise<void> }> =>
+  new Promise((resolve) => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-ext-daemon-"));
+    const socketPath = join(dir, "d.sock");
+    const connections: Socket[] = [];
+    const server: Server = createServer((conn) => {
+      connections.push(conn);
+      conn.on("error", () => undefined);
+      const rl = createInterface({ input: conn, crlfDelay: Infinity });
+      rl.on("line", (line) => {
+        const msg = deserialize(line);
+        if (msg?.type === "control" && msg.action === "register") {
+          onRegister(conn, msg.clientId);
+        } else if (msg?.type === "request") {
+          onRequest(conn, msg);
+        }
+      });
+    });
+    server.listen(socketPath, () => {
+      resolve({
+        socketPath,
+        dispose: () =>
+          new Promise((done) => {
+            for (const c of connections) c.destroy();
+            server.close(() => {
+              rmSync(dir, { recursive: true, force: true });
+              done();
+            });
+          }),
+      });
+    });
+  });
 
 describe("browser harness extension", () => {
   let agentDir: string;
@@ -238,13 +285,26 @@ describe("createExtension wiring", () => {
 
   test("restored ownership from the branch reaches the client factory", async () => {
     const w = await wire();
+    w.pi.setFlag("browser-namespace", "matched-ns");
     const ctx = fakeCtx({
       branch: [
-        { type: "custom", customType: "browser-harness-state", data: { namespace: "old", ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 } },
+        { type: "custom", customType: "browser-harness-state", data: { namespace: "matched-ns", ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 } },
       ],
     });
     await w.pi.emit("session_start", { type: "session_start" }, ctx.ctx);
-    assert.deepEqual(w.clientOpts[0]?.initialOwnership, { ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 });
+    assert.deepEqual(w.clientOpts[0]?.initialOwnership, { namespace: "matched-ns", ownedTargetIds: ["tab-1"], harnessWindowTargetId: "tab-1", harnessWindowId: 3 });
+  });
+
+  test("cross-namespace ownership rejection: branch state from namespace A is rejected when running in namespace B", async () => {
+    const w = await wire();
+    w.pi.setFlag("browser-namespace", "namespace-B");
+    const ctx = fakeCtx({
+      branch: [
+        { type: "custom", customType: "browser-harness-state", data: { namespace: "namespace-A", ownedTargetIds: ["tab-A"], harnessWindowTargetId: "tab-A", harnessWindowId: 1 } },
+      ],
+    });
+    await w.pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+    assert.deepEqual(w.clientOpts[0]?.initialOwnership, { namespace: "namespace-B", ownedTargetIds: [] });
   });
 
   test("browser-status after session_start reports the injected client's pin", async () => {
@@ -253,5 +313,324 @@ describe("createExtension wiring", () => {
     const ctx = fakeCtx();
     await w.pi.command("browser-status").handler("", ctx.ctx);
     assert.match(ctx.notices[0]?.message ?? "", /Browser: .*Connected/);
+  });
+
+  test("real createDaemonTransport in createExtension: successful valid provenance reuses window with zero launches", { skip: SKIP_SOCKET }, async () => {
+    const extPin: ProfilePin = { userDataDir: PIN.userDataDir, profileDir: "Default", label: "Alice", savedAt: "" };
+    const PAGE_JSON = JSON.stringify({
+      url: "https://example.test/",
+      title: "Reused Page",
+      w: 800,
+      h: 600,
+      sx: 0,
+      sy: 0,
+      pw: 800,
+      ph: 600,
+    });
+
+    const daemon = await createIsolatedDaemon(
+      (conn, clientId) => {
+        const ack: WireControl = {
+          type: "control",
+          action: "registered",
+          clientId,
+          browserId: "b-daemon-entry",
+          userDataDir: PIN.userDataDir,
+          cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-entry",
+        };
+        conn.write(serialize(ack) + "\n");
+      },
+      (conn, req) => {
+        if (req.method === DAEMON_RECONNECT_METHOD) {
+          conn.write(serialize({
+            type: "response",
+            id: req.id,
+            result: {
+              connected: true,
+              browserId: "b-daemon-entry",
+              userDataDir: PIN.userDataDir,
+              cdpUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-entry",
+            },
+          }) + "\n");
+        } else if (req.method === "Target.getTargets") {
+          conn.write(serialize({
+            type: "response",
+            id: req.id,
+            result: { targetInfos: [{ targetId: "tab-reused", type: "page", title: "Reused Page", url: "https://example.test/" }] },
+          }) + "\n");
+        } else if (req.method === "Target.attachToTarget") {
+          conn.write(serialize({ type: "response", id: req.id, result: { sessionId: "s-reused" } }) + "\n");
+        } else if (req.method === "Browser.getWindowForTarget") {
+          conn.write(serialize({ type: "response", id: req.id, result: { windowId: 55 } }) + "\n");
+        } else if (req.method === "Runtime.evaluate") {
+          conn.write(serialize({ type: "response", id: req.id, result: { result: { type: "string", value: PAGE_JSON } } }) + "\n");
+        } else {
+          conn.write(serialize({ type: "response", id: req.id, result: {} }) + "\n");
+        }
+      },
+    );
+
+    try {
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: PIN.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({
+            sentinelUrl: "file:///tmp/sentinel.html",
+            cleanup: () => Promise.resolve(),
+            kill: () => undefined,
+          }));
+        },
+        deadlineMs: 2_000,
+        pollMs: 10,
+      };
+
+      const extension = createExtension({
+        createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
+        readPin: () => Promise.resolve(extPin),
+        seedDeps,
+        discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-daemon-entry" })),
+      });
+
+      const pi = fakePi();
+      pi.setFlag("browser-namespace", "fresh-session");
+      extension(pi.pi);
+
+      const ctx = fakeCtx({
+        branch: [
+          {
+            type: "custom",
+            customType: "browser-harness-state",
+            data: {
+              namespace: "fresh-session",
+              browserId: "b-daemon-entry",
+              userDataDir: PIN.userDataDir,
+              profilePin: extPin,
+              ownedTargetIds: ["tab-reused"],
+              harnessWindowTargetId: "tab-reused",
+              profileContext: { kind: "default" },
+            },
+          },
+        ],
+      });
+
+      await pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+
+      await pi.command("browser-reload-daemon").handler("", ctx.ctx);
+
+      await pi.command("browser-status").handler("", ctx.ctx);
+
+      assert.equal(launches.length, 0, "fresh reuse through createExtension must not launch any service window");
+      assert.match(ctx.notices.find((n) => n.message.includes("Browser:"))?.message ?? "", /Browser: .*Connected/);
+      assert.match(ctx.notices.find((n) => n.message.includes("Reused Page"))?.message ?? "", /Reused Page/);
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("real createDaemonTransport in createExtension: missing/legacy handshake provenance fails closed before spawn", { skip: SKIP_SOCKET }, async () => {
+    const extPin: ProfilePin = { userDataDir: PIN.userDataDir, profileDir: "Default", label: "Alice", savedAt: "" };
+    const daemon = await createIsolatedDaemon((conn, clientId) => {
+      const ack: WireControl = { type: "control", action: "registered", clientId };
+      conn.write(serialize(ack) + "\n");
+    });
+
+    try {
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: PIN.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+        },
+      };
+
+      const extension = createExtension({
+        createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
+        readPin: () => Promise.resolve(extPin),
+        seedDeps,
+        discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/b-legacy" })),
+      });
+
+      const pi = fakePi();
+      pi.setFlag("browser-namespace", "fresh-session");
+      extension(pi.pi);
+
+      const ctx = fakeCtx();
+      await pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+
+      await pi.command("browser-reload-daemon").handler("", ctx.ctx);
+
+      assert.equal(launches.length, 0, "must fail closed before spawn when daemon sends no provenance");
+      assert.match(ctx.notices.find((n) => n.message.includes("Restart failed:"))?.message ?? "", /no verified user-data-dir endpoint linkage/i);
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("real createDaemonTransport in createExtension: daemon connected to B while discovery found A fails closed before spawn", { skip: SKIP_SOCKET }, async () => {
+    const extPin: ProfilePin = { userDataDir: "/home/u/.config/browser-A", profileDir: "Default", label: "Profile A", savedAt: "" };
+    const daemon = await createIsolatedDaemon(
+      (conn, clientId) => {
+        const ack: WireControl = {
+          type: "control",
+          action: "registered",
+          clientId,
+          browserId: "browser-B",
+          userDataDir: "/home/u/.config/browser-B",
+          cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
+        };
+        conn.write(serialize(ack) + "\n");
+      },
+      (conn, req) => {
+        if (req.method === DAEMON_RECONNECT_METHOD) {
+          conn.write(serialize({
+            type: "response",
+            id: req.id,
+            result: {
+              connected: true,
+              browserId: "browser-B",
+              userDataDir: "/home/u/.config/browser-B",
+              cdpUrl: "ws://127.0.0.1:9222/devtools/browser/browser-B",
+            },
+          }) + "\n");
+        } else {
+          conn.write(serialize({ type: "response", id: req.id, result: {} }) + "\n");
+        }
+      },
+    );
+
+    try {
+      const launches: ProfileWindowRequest[] = [];
+      const seedDeps: SeedDeps = {
+        detectRunningBrowser: () => Promise.resolve({
+          running: true,
+          exePath: "/usr/bin/google-chrome",
+          explicitUserDataDir: extPin.userDataDir,
+        }),
+        resolveBrowserExecutable: () => Promise.resolve("/usr/bin/google-chrome"),
+        openProfileWindow: (req) => {
+          launches.push(req);
+          return Promise.resolve(ok({ sentinelUrl: "file:///tmp/s.html", cleanup: () => Promise.resolve(), kill: () => undefined }));
+        },
+      };
+
+      const extension = createExtension({
+        createTransport: (ns) => createDaemonTransport(ns, daemon.socketPath),
+        readPin: () => Promise.resolve(extPin),
+        seedDeps,
+        discoverEndpoint: () => Promise.resolve(ok({ wsUrl: "ws://127.0.0.1:9222/devtools/browser/discovered-A", userDataDir: extPin.userDataDir })),
+      });
+
+      const pi = fakePi();
+      pi.setFlag("browser-namespace", "fresh-session");
+      extension(pi.pi);
+
+      const ctx = fakeCtx();
+      await pi.emit("session_start", { type: "session_start" }, ctx.ctx);
+
+      await pi.command("browser-reload-daemon").handler("", ctx.ctx);
+
+      assert.equal(launches.length, 0, "must fail closed before spawn on mismatch between transport and pin");
+      assert.match(
+        ctx.notices.find((n) => n.message.includes("Restart failed:"))?.message ?? "",
+        /belongs to \/home\/u\/\.config\/browser-A, but the harness is connected to \/home\/u\/\.config\/browser-B/,
+      );
+    } finally {
+      await daemon.dispose();
+    }
+  });
+
+  test("cleared harness window persists deletion and fresh createExtension restores undefined", async () => {
+    let capturedOnOwnershipChange: ((snap: {
+      readonly browserId?: string | undefined;
+      readonly userDataDir?: string | undefined;
+      readonly profilePin?: { readonly userDataDir: string; readonly profileDir: string } | undefined;
+      readonly ownedTargetIds: ReadonlyArray<string>;
+      readonly harnessWindowTargetId: string | undefined;
+      readonly harnessWindowId: number | undefined;
+      readonly profileContext?: ProfileContext | undefined;
+    }) => void) | undefined;
+
+    const fakeClient = await createFakeClient();
+    const extension1 = createExtension({
+      createTransport: () => createStubTransport().transport,
+      createClient: (o) => {
+        capturedOnOwnershipChange = o.onOwnershipChange;
+        return fakeClient.client;
+      },
+      readPin: () => Promise.resolve(PIN),
+    });
+
+    const pi1 = fakePi();
+    pi1.setFlag("browser-namespace", "team-persist");
+    extension1(pi1.pi);
+
+    const branch: Array<{ type: string; customType: string; data: unknown }> = [];
+    const ctx1 = fakeCtx({ branch });
+    pi1.pi.appendEntry = (customType: string, data: unknown) => {
+      branch.push({ type: "custom", customType, data });
+    };
+
+    await pi1.emit("session_start", { type: "session_start" }, ctx1.ctx);
+
+    capturedOnOwnershipChange?.({
+      browserId: "b1",
+      userDataDir: PIN.userDataDir,
+      profilePin: PIN,
+      ownedTargetIds: ["w1"],
+      harnessWindowTargetId: "w1",
+      harnessWindowId: 10,
+      profileContext: { kind: "default" },
+    });
+
+    assert.equal(branch.length, 1);
+    const firstSaved = isRecord(branch[0]?.data) ? branch[0].data : {};
+    assert.equal(firstSaved["harnessWindowTargetId"], "w1");
+
+    capturedOnOwnershipChange?.({
+      browserId: "b1",
+      userDataDir: PIN.userDataDir,
+      profilePin: PIN,
+      ownedTargetIds: [],
+      harnessWindowTargetId: undefined,
+      harnessWindowId: undefined,
+      profileContext: { kind: "unresolved" },
+    });
+
+    assert.equal(branch.length, 2, "must append new entry reflecting deletion");
+    const secondSaved = isRecord(branch[1]?.data) ? branch[1].data : {};
+    assert.equal(secondSaved["harnessWindowTargetId"], undefined);
+
+    let session2InitialOwnership: BrowserClientOptions["initialOwnership"];
+    const extension2 = createExtension({
+      createTransport: () => createStubTransport().transport,
+      createClient: (o) => {
+        session2InitialOwnership = o.initialOwnership;
+        return fakeClient.client;
+      },
+      readPin: () => Promise.resolve(PIN),
+    });
+
+    const pi2 = fakePi();
+    pi2.setFlag("browser-namespace", "team-persist");
+    extension2(pi2.pi);
+    const ctx2 = fakeCtx({ branch });
+
+    await pi2.emit("session_start", { type: "session_start" }, ctx2.ctx);
+
+    assert.equal(session2InitialOwnership?.harnessWindowTargetId, undefined, "restored harnessWindowTargetId must be undefined");
+    assert.deepEqual(session2InitialOwnership?.ownedTargetIds, [], "restored ownedTargetIds must be empty");
   });
 });

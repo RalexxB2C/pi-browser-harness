@@ -34,25 +34,32 @@ const pageTargets = async (client: BrowserClient): Promise<ReadonlyArray<PageTar
   );
 };
 
+export const unlinkedEndpointHint = (pin: ProfilePin): string =>
+  `the connected browser endpoint cannot be proven to belong to ${pin.userDataDir}. ` +
+  `Ensure remote debugging is enabled for "${pin.label}". If the running daemon is from an older package, disconnect all harness clients and wait for its idle shutdown, or ask the operator to verify and stop only the daemon PID running this package's src/daemon/main.ts. ` +
+  `Then start a new Pi session with the updated package and run /browser-setup. /browser-setup and /browser-reload-daemon do not replace a running legacy daemon. Do not stop Chrome or delete a live daemon socket. ` +
+  `Use /browser-profile to choose a profile from the connected browser if the profile selection is wrong.`;
+
 const manualFallbackHint = (pin: ProfilePin): string =>
   `open a window for "${pin.label}" yourself (browser profile menu → ${pin.profileDir}), then retry. ` +
   `Run /browser-profile to pick a different profile, or clear the selection to use whichever window is focused.`;
 
-export const seedProfileWindow = async (
+export const verifyConnectedBrowserIdentity = async (
   client: BrowserClient,
   pin: ProfilePin,
   deps: SeedDeps = {},
-): Promise<Result<string, CdpError>> => {
+): Promise<Result<{ exePath: string; running: RunningBrowser }, CdpError>> => {
   const detect = deps.detectRunningBrowser ?? detectRunningBrowser;
   const resolveExe = deps.resolveBrowserExecutable ?? resolveBrowserExecutable;
-  const launch = deps.openProfileWindow ?? openProfileWindow;
-  const sleep = deps.sleep ?? sleepMs;
-  const now = deps.now ?? Date.now;
-  const deadlineMs = deps.deadlineMs ?? SEED_DEADLINE_MS;
-  const pollMs = deps.pollMs ?? SEED_POLL_MS;
 
   const connectedDir = client.userDataDir();
-  if (connectedDir && connectedDir !== pin.userDataDir) {
+  if (!connectedDir) {
+    return err(cdpError(
+      "discovery_failed",
+      `could not verify connected browser identity for "${pin.label}": connected browser has no verified user-data-dir endpoint linkage — ${unlinkedEndpointHint(pin)}`,
+    ));
+  }
+  if (connectedDir !== pin.userDataDir) {
     return err(cdpError(
       "discovery_failed",
       `the selected profile "${pin.label}" belongs to ${pin.userDataDir}, but the harness is connected to ${connectedDir}. ` +
@@ -60,8 +67,29 @@ export const seedProfileWindow = async (
     ));
   }
 
-  const targetUserDataDir = connectedDir ?? pin.userDataDir;
+  const targetUserDataDir = connectedDir;
   const running = await detect(targetUserDataDir);
+  if (running.ambiguous) {
+    return err(cdpError(
+      "discovery_failed",
+      `could not verify browser identity for "${pin.label}": ${running.error ?? "ambiguous browser candidates"} — ${manualFallbackHint(pin)}`,
+    ));
+  }
+  if (!running.running) {
+    return err(cdpError(
+      "discovery_failed",
+      running.error
+        ? `${running.error} — ${manualFallbackHint(pin)}`
+        : `could not locate the browser executable needed to open "${pin.label}" — ${manualFallbackHint(pin)}`,
+    ));
+  }
+  const runningDir = running.explicitUserDataDir ?? running.verifiedUserDataDir;
+  if (runningDir && runningDir !== targetUserDataDir) {
+    return err(cdpError(
+      "discovery_failed",
+      `running browser's user-data-dir (${runningDir}) does not match the pinned profile (${targetUserDataDir}) — ${manualFallbackHint(pin)}`,
+    ));
+  }
   const exePath = await resolveExe(running);
   if (!exePath) {
     return err(cdpError(
@@ -70,11 +98,51 @@ export const seedProfileWindow = async (
     ));
   }
 
+  return ok({ exePath, running });
+};
+
+export const seedProfileWindow = async (
+  client: BrowserClient,
+  pin: ProfilePin,
+  deps: SeedDeps = {},
+  isCurrent?: () => boolean,
+): Promise<Result<string, CdpError>> => {
+  const launch = deps.openProfileWindow ?? openProfileWindow;
+  const sleep = deps.sleep ?? sleepMs;
+  const now = deps.now ?? Date.now;
+  const deadlineMs = deps.deadlineMs ?? SEED_DEADLINE_MS;
+  const pollMs = deps.pollMs ?? SEED_POLL_MS;
+
+  const generation = client.profileGeneration();
+  const checkPinValid = (): Result<void, CdpError> => {
+    if (client.profileGeneration() !== generation || (isCurrent && !isCurrent())) {
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+    const current = client.profilePin();
+    const pinChanged = current !== null && (current.profileDir !== pin.profileDir || current.userDataDir !== pin.userDataDir);
+    if (pinChanged) {
+      return err(cdpError("discovery_failed", "profile pin changed during initialization"));
+    }
+    return ok(undefined);
+  };
+
+  const initialCheck = checkPinValid();
+  if (!initialCheck.success) return initialCheck;
+
+  const verified = await verifyConnectedBrowserIdentity(client, pin, deps);
+  if (!verified.success) return verified;
+
+  const preLaunchCheck = checkPinValid();
+  if (!preLaunchCheck.success) return preLaunchCheck;
+
+  const { exePath, running } = verified.data;
+  const verifiedDir = running.explicitUserDataDir ?? running.verifiedUserDataDir;
+
   const launched = await launch({
     exePath,
     profileDir: pin.profileDir,
-    // ProcessSingleton keys on the user-data-dir path, so forward only the value the running browser reports: a reconstructed one may differ by case and start a SECOND browser.
-    ...(running.explicitUserDataDir ? { explicitUserDataDir: running.explicitUserDataDir } : {}),
+    // Forward only the directory proven by process arguments or kernel socket ownership.
+    ...(verifiedDir ? { explicitUserDataDir: verifiedDir } : {}),
   });
   if (!launched.success) {
     return err(cdpError("discovery_failed", `${launched.error} — ${manualFallbackHint(pin)}`));
@@ -84,7 +152,19 @@ export const seedProfileWindow = async (
   const deadline = now() + deadlineMs;
   let seed: PageTarget | undefined;
   while (now() < deadline && !seed) {
+    const preSleepCheck = checkPinValid();
+    if (!preSleepCheck.success) {
+      kill();
+      await cleanup();
+      return preSleepCheck;
+    }
     await sleep(pollMs);
+    const postSleepCheck = checkPinValid();
+    if (!postSleepCheck.success) {
+      kill();
+      await cleanup();
+      return postSleepCheck;
+    }
     seed = (await pageTargets(client)).find((t) => t.url === sentinelUrl);
   }
 
@@ -97,19 +177,44 @@ export const seedProfileWindow = async (
     ));
   }
 
+  const preMutationCheck = checkPinValid();
+  if (!preMutationCheck.success) {
+    kill();
+    await cleanup();
+    return preMutationCheck;
+  }
+
+  const win = await client.session().windowId(seed.targetId);
+  const prePublishCheck = checkPinValid();
+  if (!prePublishCheck.success) {
+    kill();
+    await cleanup();
+    return prePublishCheck;
+  }
+
   // The sentinel's context is the profile's context — the only way to learn it.
-  if (seed.browserContextId) client.setProfileContextId(seed.browserContextId);
+  if (seed.browserContextId) {
+    client.setProfileContext({ kind: "named", contextId: seed.browserContextId });
+    client.setProfileContextId(seed.browserContextId);
+  } else {
+    client.setProfileContext({ kind: "default" });
+  }
 
   const ownership = client.ownership();
   ownership.setHarnessWindow(seed.targetId);
   ownership.add(seed.targetId);
-  const win = await client.session().windowId(seed.targetId);
   if (win.success) ownership.setHarnessWindowId(win.data);
 
   // Clears the sentinel URL from the seed tab. The session is borrowed and released so an untracked attach never outlives this call.
   const borrowed = await borrowSession(client, seed.targetId);
   if (borrowed.success) {
     try {
+      const preNavigateCheck = checkPinValid();
+      if (!preNavigateCheck.success) {
+        kill();
+        await cleanup();
+        return preNavigateCheck;
+      }
       await client.session().callOnTarget("Page.navigate", { url: "about:blank" }, borrowed.data.sessionId);
     } finally {
       await borrowed.data.release();

@@ -5,6 +5,7 @@ import { createOwnershipRegistry, type OwnershipRegistry } from "../../src/cdp/o
 import { type CdpError, cdpError } from "../../src/cdp/errors";
 import type { CdpEvent, CdpTransport, RefSignature } from "../../src/cdp/types";
 import type { BrowserClient } from "../../src/client";
+import type { ProfilePin } from "../../src/profile/store";
 import { createMutex } from "../../src/util/mutex";
 import { type Result, err, ok } from "../../src/util/result";
 import type { HandlerContext } from "../../src/util/tool";
@@ -39,7 +40,10 @@ const DEFAULT_ATTACH: Canned = {
   "Browser.getWindowForTarget": ok({ windowId: 7 }),
 };
 
-export const createStubTransport = (canned: Canned = {}): StubTransport => {
+export const createStubTransport = (
+  canned: Canned = {},
+  endpoint?: { readonly wsUrl?: string; readonly browserId?: string; readonly userDataDir?: string },
+): StubTransport => {
   const calls: RecordedCall[] = [];
   const queues = new Map<string, CannedResult[]>();
   for (const [method, value] of Object.entries(canned)) {
@@ -78,6 +82,7 @@ export const createStubTransport = (canned: Canned = {}): StubTransport => {
     }),
     state: () => "open",
     onClose: () => noop,
+    ...(endpoint !== undefined ? { actualEndpoint: () => endpoint } : {}),
   };
 
   return {
@@ -100,6 +105,9 @@ export type FakeClientOptions = {
   readonly evaluate?: (expression: string, sessionId?: string) => Result<unknown, CdpError>;
   readonly refs?: ReadonlyArray<{ readonly ref: string; readonly backendId: number; readonly sig?: RefSignature }>;
   readonly ownedTargetIds?: ReadonlyArray<string>;
+  readonly userDataDir?: string;
+  readonly profilePin?: ProfilePin | null;
+  readonly actualEndpoint?: { readonly wsUrl?: string; readonly browserId?: string; readonly userDataDir?: string };
 };
 
 export type FakeClient = {
@@ -116,7 +124,7 @@ const notConfigured = <T>(what: string): Result<T, CdpError> =>
   err(cdpError("invalid_response", `fake client: ${what} was called but not configured`));
 
 export const createFakeClient = async (opts: FakeClientOptions = {}): Promise<FakeClient> => {
-  const stub = createStubTransport({ ...DEFAULT_ATTACH, ...(opts.canned ?? {}) });
+  const stub = createStubTransport({ ...DEFAULT_ATTACH, ...(opts.canned ?? {}) }, opts.actualEndpoint);
   const ownership = createOwnershipRegistry({ ownedTargetIds: opts.ownedTargetIds ?? ["t1"] });
   const session = createCdpSession(stub.transport, ownership);
   const mutex = createMutex();
@@ -161,13 +169,19 @@ export const createFakeClient = async (opts: FakeClientOptions = {}): Promise<Fa
     current: () => session.current(),
     session: () => session,
     transport: () => stub.transport,
-    userDataDir: () => undefined,
-    profilePin: () => null,
+    userDataDir: () => opts.userDataDir,
+    profilePin: () => opts.profilePin ?? null,
+    profileGeneration: () => 0,
     setProfilePin: noop,
+    profileContext: () => ({ kind: "unresolved" }),
+    setProfileContext: noop,
     profileContextId: () => undefined,
     setProfileContextId: noop,
+    verifyProfileIdentity: () => Promise.resolve(ok(undefined)),
     seedPinnedProfileWindow: () => Promise.resolve(notConfigured("seedPinnedProfileWindow")),
     mutationMutex: () => mutex,
+    browserId: () => undefined,
+    latchedFailure: () => null,
   };
 
   return {

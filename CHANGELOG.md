@@ -2,6 +2,22 @@
 
 All notable changes to pi-browser-harness will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- **Verified connected browser identity before service-window creation.** The launcher checks connected transport, process, and user-data-dir evidence to prove the target browser matches the pinned profile. Candidates without verified directory ownership fail closed before spawning any process.
+- **Safe target reuse across fresh clients.** Fresh sessions and clients restore persisted ownership with verified browser and profile provenance, safely reusing eligible harness-owned windows without foreign-tab adoption or redundant launches.
+
+### Fixed
+
+- Standard Chrome launches on Linux no longer require an explicit `--user-data-dir` flag when the local profile lock PID owns the profile's listening singleton socket in the kernel. Stale locks, remote hosts, and sockets owned by another process remain unverified. The verified directory is forwarded when opening a profile window.
+- Profile changes invalidate in-flight target discovery, seeding, and session publication, including changes away from and back to the same profile. Cancelled initialization stays latched until explicit setup.
+- A request waiting on a closing Chrome connection cannot run on its replacement. Old IPC registrations are invalidated before admitting work on the replacement, without waiting for the old socket's close event. An old registration cannot erase a newer client's reservation.
+- Losing the transport connection invalidates cached identity and in-flight profile-window launches even when the selected profile has not changed. Legacy-daemon recovery instructions explain how to replace the daemon safely after a package update.
+- **Latched initialization failures with explicit setup recovery.** The client remembers the root cause of an initialization failure. Subsequent ordinary reads return the stored cause immediately without repeating initialization or launching service windows. Only an explicitly requested setup (`/browser-setup`, `browser_setup`, or daemon reconnect) permits a retry.
+- **Root cause preservation on missing daemon socket.** The tool wrapper surfaces the stored initialization failure cause before checking daemon socket existence, preventing premature generic setup error messages.
+
 ## 0.13.0 — 2026-10-20
 
 ### Fixed

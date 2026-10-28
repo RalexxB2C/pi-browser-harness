@@ -11,6 +11,7 @@ import { type Result, err, ok } from "../../src/util/result";
 import { type ChromeSocket, type ConnectionEndReason, createChromeConnection } from "../../src/daemon/connection";
 import { createCdpBridge, describeDisconnected } from "../../src/daemon/bridge";
 import { DAEMON_RECONNECT_METHOD, type WireResponse } from "../../src/daemon/protocol";
+import { isRecord } from "../../src/util/guards";
 
 class FakeSocket extends EventEmitter implements ChromeSocket {
   public readyState = 0;
@@ -150,6 +151,58 @@ describe("chrome connection: one dial, one prompt", () => {
     h.connection.stop();
   });
 
+  test("X1: a late close on an older superseded generation does not clear the active provenance of a newer generation", async () => {
+    const endpoints = ["ws://127.0.0.1:9222/devtools/browser/gen1", "ws://127.0.0.1:9222/devtools/browser/gen2"];
+    let call = 0;
+    const h = harness({
+      connectTimeoutMs: 10,
+      attemptLifetimeMs: 500,
+      cooldownMs: 0,
+      discover: () => Promise.resolve(ok(endpoints[call++] ?? "ws://fake")),
+    });
+
+    const dial1 = h.connection.connect();
+    await sleep(2);
+    const sock1 = h.sockets[0];
+    assert.ok(sock1);
+    sock1.open();
+    await dial1;
+
+    assert.equal(h.connection.isOpen(), true);
+    assert.deepEqual(h.connection.provenance(), {
+      browserId: "gen1",
+      cdpUrl: "ws://127.0.0.1:9222/devtools/browser/gen1",
+    });
+
+    // sock1 enters closing state before close event arrives (closing-old)
+    sock1.readyState = 2;
+
+    const dial2 = h.connection.connect();
+    await sleep(2);
+    const sock2 = h.sockets[1];
+    assert.ok(sock2);
+    sock2.open();
+    await dial2;
+
+    assert.equal(h.connection.isOpen(), true);
+    assert.deepEqual(h.connection.provenance(), {
+      browserId: "gen2",
+      cdpUrl: "ws://127.0.0.1:9222/devtools/browser/gen2",
+    });
+
+    // Delayed close on the older socket (generation 1)
+    sock1.drop();
+    await sleep(5);
+
+    assert.equal(h.connection.isOpen(), true);
+    assert.deepEqual(h.connection.provenance(), {
+      browserId: "gen2",
+      cdpUrl: "ws://127.0.0.1:9222/devtools/browser/gen2",
+    });
+
+    h.connection.stop();
+  });
+
   test("a dropped connection re-dials at once on the next demand (the one legitimate prompt after resume)", async () => {
     const h = harness({ connectTimeoutMs: 10, attemptLifetimeMs: 500, cooldownMs: 10_000 });
     const open = h.connection.connect();
@@ -196,7 +249,7 @@ describe("bridge messages while disconnected", () => {
     await sleep(2);
     sockets.at(-1)?.open();
     const r3 = await reconnect;
-    assert.deepEqual(r3?.result, { connected: true });
+    assert.equal(isRecord(r3?.result) ? r3.result["connected"] : false, true);
     assert.equal(bridge.isAlive(), true);
     await bridge.stop();
   });

@@ -2,8 +2,9 @@
 // `wmic` is deliberately unused — Microsoft removed it by default in Windows 11 24H2 and entirely in 25H2, so PowerShell CIM plus tasklist replace it.
 
 import { execFile } from "node:child_process";
-import { access, readFile, readlink } from "node:fs/promises";
-import { join } from "node:path";
+import { access, readFile, readlink, readdir, stat } from "node:fs/promises";
+import { hostname } from "node:os";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
@@ -17,6 +18,9 @@ export type RunningBrowser = {
   readonly running: boolean;
   readonly exePath?: string;
   readonly explicitUserDataDir?: string;
+  readonly verifiedUserDataDir?: string;
+  readonly ambiguous?: boolean;
+  readonly error?: string;
 };
 
 const LINUX_COMMS: ReadonlyArray<string> = [
@@ -46,7 +50,8 @@ const USER_DATA_DIR_FLAG = "--user-data-dir=";
 export const userDataDirFromArgv = (argv: ReadonlyArray<string>): string | undefined => {
   const flag = argv.find((arg) => arg.startsWith(USER_DATA_DIR_FLAG));
   const value = flag?.slice(USER_DATA_DIR_FLAG.length);
-  return value !== undefined && value.length > 0 ? value : undefined;
+  // Chrome can rewrite all arguments into a single NUL-terminated process title.
+  return value !== undefined && value.length > 0 ? value : parseUserDataDirFlag(argv[0] ?? "");
 };
 const MAC_BROWSER_NAMES: ReadonlyArray<string> = [
   "google chrome", "chromium", "microsoft edge", "brave browser",
@@ -74,6 +79,7 @@ const isMacChildProcessName = (comm: string): boolean => {
 export type BrowserCandidate = {
   readonly exePath?: string;
   readonly explicitUserDataDir?: string;
+  readonly verifiedUserDataDir?: string;
 };
 
 // A package upgrade under a running browser makes `/proc/<pid>/exe` read "… (deleted)", which fails to spawn with ENOENT unless the marker comes off.
@@ -114,6 +120,9 @@ export const rankBrowserCandidate = (candidate: BrowserCandidate, preferUserData
   if (candidate.explicitUserDataDir) {
     return samePath(candidate.explicitUserDataDir, preferUserDataDir) ? 4 : 0;
   }
+  if (candidate.verifiedUserDataDir) {
+    return samePath(candidate.verifiedUserDataDir, preferUserDataDir) ? 4 : 0;
+  }
   const family = browserNameForUserDataDir(preferUserDataDir).toLowerCase();
   const exe = (candidate.exePath ?? "").toLowerCase();
   if (!exe) return 1;
@@ -131,7 +140,42 @@ export const parseUserDataDirFlag = (commandLine: string): string | undefined =>
   return value && value.length > 0 ? value : undefined;
 };
 
-const collectLinux = async (): Promise<ReadonlyArray<BrowserCandidate>> => {
+export const linuxProfileOwnerPid = async (userDataDir: string): Promise<string | undefined> => {
+  try {
+    const lockPath = join(userDataDir, "SingletonLock");
+    const socketLink = join(userDataDir, "SingletonSocket");
+    const lock = await readlink(lockPath);
+    const prefix = `${hostname()}-`;
+    if (!lock.startsWith(prefix)) return undefined;
+    const pid = lock.slice(prefix.length);
+    if (!/^[1-9]\d*$/.test(pid)) return undefined;
+    if ((await stat(`/proc/${pid}`)).uid !== process.getuid?.()) return undefined;
+
+    const socketTarget = await readlink(socketLink);
+    const socketPath = resolve(userDataDir, socketTarget);
+    const sockets = await readFile("/proc/net/unix", "utf8");
+    for (const line of sockets.split("\n")) {
+      const match = /^\S+\s+\S+\s+\S+\s+00010000\s+0001\s+01\s+(\d+)\s+(.+)$/.exec(line);
+      if (match?.[2] !== socketPath) continue;
+      const expectedFd = `socket:[${match[1]}]`;
+      for (const fd of await readdir(`/proc/${pid}/fd`)) {
+        let target: string;
+        try {
+          target = await readlink(`/proc/${pid}/fd/${fd}`);
+        } catch {
+          continue;
+        }
+        // A stale lock or reused PID cannot prove ownership without the kernel socket.
+        if (target === expectedFd && await readlink(lockPath) === lock && await readlink(socketLink) === socketTarget) return pid;
+      }
+    }
+  } catch {
+    // Missing, stale, or inaccessible evidence must not relax identity verification.
+  }
+  return undefined;
+};
+
+const collectLinux = async (preferUserDataDir?: string): Promise<ReadonlyArray<BrowserCandidate>> => {
   let pids: string[];
   try {
     const { stdout } = await run("ps", ["-A", "-o", "pid=,comm="], { timeout: EXEC_TIMEOUT_MS });
@@ -147,6 +191,7 @@ const collectLinux = async (): Promise<ReadonlyArray<BrowserCandidate>> => {
     return [];
   }
 
+  const ownerPid = preferUserDataDir ? await linuxProfileOwnerPid(preferUserDataDir) : undefined;
   const candidates: BrowserCandidate[] = [];
   for (const pid of pids) {
     let argv: ReadonlyArray<string>;
@@ -171,6 +216,7 @@ const collectLinux = async (): Promise<ReadonlyArray<BrowserCandidate>> => {
     candidates.push({
       ...(exePath ? { exePath } : {}),
       ...(explicit ? { explicitUserDataDir: explicit } : {}),
+      ...(pid === ownerPid && preferUserDataDir ? { verifiedUserDataDir: preferUserDataDir } : {}),
     });
   }
   return candidates;
@@ -308,40 +354,77 @@ const winRegistryExecutable = async (): Promise<string | undefined> => {
   return undefined;
 };
 
+export const selectBrowserCandidate = (
+  candidates: ReadonlyArray<BrowserCandidate>,
+  preferUserDataDir?: string,
+): RunningBrowser => {
+  if (candidates.length === 0) return { running: false };
+
+  if (!preferUserDataDir) {
+    const first = candidates[0];
+    return {
+      running: true,
+      ...(first?.exePath ? { exePath: first.exePath } : {}),
+      ...(first?.explicitUserDataDir ? { explicitUserDataDir: first.explicitUserDataDir } : {}),
+    };
+  }
+
+  const exactMatches = candidates.filter((c) => rankBrowserCandidate(c, preferUserDataDir) === 4);
+  if (exactMatches.length > 0) {
+    const distinctExes = Array.from(new Set(exactMatches.map((c) => c.exePath).filter((p): p is string => Boolean(p))));
+    if (distinctExes.length === 1) {
+      const matchExe = distinctExes[0];
+      const matchDir = exactMatches[0]?.explicitUserDataDir;
+      const verifiedDir = exactMatches[0]?.verifiedUserDataDir;
+      return {
+        running: true,
+        ...(matchExe ? { exePath: matchExe } : {}),
+        ...(matchDir ? { explicitUserDataDir: matchDir } : {}),
+        ...(verifiedDir ? { verifiedUserDataDir: verifiedDir } : {}),
+      };
+    }
+    return {
+      running: true,
+      ambiguous: true,
+      error: `multiple distinct browser executables (${distinctExes.join(", ")}) claim ${preferUserDataDir}`,
+    };
+  }
+
+  const familyMatches = candidates.filter((c) => rankBrowserCandidate(c, preferUserDataDir) === 3);
+  if (familyMatches.length > 0) {
+    const distinctExes = Array.from(new Set(familyMatches.map((c) => c.exePath).filter((p): p is string => Boolean(p))));
+    const candidateList = distinctExes.length > 0 ? distinctExes.join(", ") : "unknown";
+    return {
+      running: true,
+      ambiguous: true,
+      error: `ambiguous browser identity: candidate (${candidateList}) lacks an explicit user-data-dir flag for ${preferUserDataDir}`,
+    };
+  }
+
+  return {
+    running: false,
+    error: `no running browser candidate matches ${preferUserDataDir}`,
+  };
+};
+
 export const detectRunningBrowser = async (preferUserDataDir?: string): Promise<RunningBrowser> => {
   const candidates =
     process.platform === "darwin"
       ? await collectDarwin()
       : process.platform === "win32"
         ? await collectWin32()
-        : await collectLinux();
-  if (candidates.length === 0) return { running: false };
-
-  const [first, ...rest] = candidates;
-  if (!first) return { running: false };
-  let best = first;
-  let bestRank = rankBrowserCandidate(best, preferUserDataDir);
-  for (const candidate of rest) {
-    const rank = rankBrowserCandidate(candidate, preferUserDataDir);
-    if (rank > bestRank) {
-      best = candidate;
-      bestRank = rank;
-    }
-  }
-
-  return {
-    running: true,
-    ...(best.exePath ? { exePath: best.exePath } : {}),
-    ...(best.explicitUserDataDir ? { explicitUserDataDir: best.explicitUserDataDir } : {}),
-  };
+        : await collectLinux(preferUserDataDir);
+  return selectBrowserCandidate(candidates, preferUserDataDir);
 };
 
 export const isBrowserRunning = async (): Promise<boolean> => (await detectRunningBrowser()).running;
 
 export const resolveBrowserExecutable = async (running?: RunningBrowser): Promise<string | undefined> => {
   const detected = running ?? (await detectRunningBrowser());
-  const usable = detected.exePath ? await spawnableExePath(detected.exePath) : undefined;
-  if (usable) return usable;
+  if (detected.ambiguous) return undefined;
+  if (detected.exePath) {
+    return spawnableExePath(detected.exePath);
+  }
   if (process.platform !== "win32") return undefined;
 
   const fromRegistry = await winRegistryExecutable();

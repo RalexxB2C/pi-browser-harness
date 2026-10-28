@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import { discoverWsUrl } from "../cdp/discovery";
+import { discoverEndpoint, type CdpEndpoint } from "../cdp/discovery";
 import {
   CDP_ATTEMPT_LIFETIME_MS,
   CDP_CONNECT_TIMEOUT_MS,
@@ -23,6 +23,7 @@ export type ConnectionEvents = {
 
 export type ChromeConnectionDependencies = {
   readonly discoverWsUrl?: () => Promise<Result<string, CdpError>>;
+  readonly discoverEndpoint?: () => Promise<Result<CdpEndpoint, CdpError>>;
   readonly createWebSocket?: (url: string) => ChromeSocket;
   // How long connect() waits before answering false while the dial carries on.
   readonly connectTimeoutMs?: number;
@@ -59,6 +60,7 @@ export type ChromeConnection = {
   readonly generation: () => number;
   readonly send: (payload: string) => Result<void, string>;
   readonly stop: () => void;
+  readonly provenance: () => { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
 };
 
 type Attempt = {
@@ -68,7 +70,6 @@ type Attempt = {
   socket: ChromeSocket | null;
   opened: boolean;
   ended: boolean;
-  superseded: boolean;
   failure: string | null;
   readonly settle: (opened: boolean) => void;
   readonly end: (reason: ConnectionEndReason) => void;
@@ -78,9 +79,9 @@ type Attempt = {
 // an EventEmitter-based fake without claiming to be the whole ws class.
 export type ChromeSocket = {
   readonly readyState: number;
-  on(event: "open" | "close", listener: () => void): unknown;
-  on(event: "message", listener: (data: WebSocket.Data) => void): unknown;
-  on(event: "error", listener: (error: Error) => void): unknown;
+  on(event: "open" | "close", listener: () => void): void;
+  on(event: "message", listener: (data: WebSocket.Data) => void): void;
+  on(event: "error", listener: (error: Error) => void): void;
   send(data: string): void;
   close(): void;
 };
@@ -127,7 +128,6 @@ export const createChromeConnection = (
   events: ConnectionEvents,
 ): ChromeConnection => {
   const {
-    discoverWsUrl: discover = discoverWsUrl,
     createWebSocket = (url: string): ChromeSocket => new WebSocket(url, { perMessageDeflate: false }),
     connectTimeoutMs = CDP_CONNECT_TIMEOUT_MS,
     attemptLifetimeMs = CDP_ATTEMPT_LIFETIME_MS,
@@ -137,12 +137,23 @@ export const createChromeConnection = (
     now = Date.now,
   } = deps;
 
+  const discover = async (): Promise<Result<CdpEndpoint, CdpError>> => {
+    if (deps.discoverEndpoint) return deps.discoverEndpoint();
+    if (deps.discoverWsUrl) {
+      const r = await deps.discoverWsUrl();
+      return r.success ? ok({ wsUrl: r.data }) : r;
+    }
+    return discoverEndpoint();
+  };
+
   let current: Attempt | null = null;
   let stopped = false;
   let lastGeneration = 0;
   let cooldownUntil = 0;
   let nextCooldownMs = cooldownMs;
   let lastFailure: string | null = null;
+  let activeProvenance: { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
+  let provenanceGeneration = 0;
 
   const inCooldown = (): boolean => now() < cooldownUntil;
 
@@ -176,7 +187,6 @@ export const createChromeConnection = (
       socket: null,
       opened: false,
       ended: false,
-      superseded: false,
       failure: null,
       settle: (opened) => {
         if (settled) return;
@@ -189,6 +199,9 @@ export const createChromeConnection = (
         if (attempt.ended) return;
         attempt.ended = true;
         if (current === attempt) current = null;
+        if (provenanceGeneration === generation) {
+          activeProvenance = undefined;
+        }
         if (attempt.socket) closeSocket(attempt.socket);
         if (reason === "failed") recordFailure(attempt);
         attempt.settle(false);
@@ -207,9 +220,13 @@ export const createChromeConnection = (
       return;
     }
 
+    const wsUrl = d.data.wsUrl;
+    const userDataDir = d.data.userDataDir;
+    const browserId = wsUrl.split("/").pop() ?? "unknown";
+
     let socket: ChromeSocket;
     try {
-      socket = createWebSocket(d.data);
+      socket = createWebSocket(wsUrl);
     } catch (e) {
       attempt.failure = e instanceof Error ? e.message : String(e);
       attempt.end("failed");
@@ -218,7 +235,7 @@ export const createChromeConnection = (
     attempt.socket = socket;
 
     const endFromSocket = (): void => {
-      attempt.end(!attempt.opened ? "failed" : attempt.superseded ? "superseded" : "dropped");
+      attempt.end(!attempt.opened ? "failed" : "dropped");
     };
 
     socket.on("open", () => {
@@ -231,6 +248,8 @@ export const createChromeConnection = (
         return;
       }
       attempt.opened = true;
+      activeProvenance = { browserId, cdpUrl: wsUrl, ...(userDataDir !== undefined ? { userDataDir } : {}) };
+      provenanceGeneration = attempt.generation;
       recordSuccess();
       console.log("[pi-browser-daemon] Connected to Chrome ✓");
       attempt.settle(true);
@@ -258,10 +277,8 @@ export const createChromeConnection = (
       // A dial in flight is shared: joining it is what keeps Chrome's prompt count at one.
       if (!current.opened) return waitAtMost(current.settledPromise, connectTimeoutMs);
       if (isOpen()) return Promise.resolve(true);
-      // Opened once but closing now: Chrome is going away and the close event has not arrived
-      // yet. Start a fresh attempt at once; the old socket's close still fails its own requests.
-      current.superseded = true;
-      current = null;
+      // Invalidate old registrations before a replacement browser can accept their requests.
+      current.end("superseded");
     }
     if (inCooldown()) return Promise.resolve(false);
 
@@ -319,5 +336,6 @@ export const createChromeConnection = (
     generation: () => current?.generation ?? 0,
     send,
     stop,
+    provenance: () => activeProvenance,
   };
 };

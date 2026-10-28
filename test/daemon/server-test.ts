@@ -69,6 +69,42 @@ const register = async (socketPath: string, clientId: string): Promise<Client> =
 };
 
 describe("daemon ipc server", { skip: SKIP }, () => {
+  test("an old readiness completion cannot remove a replacement client's reservation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pbh-reservation-"));
+    const socketPath = join(dir, "d.sock");
+    const gates: Array<() => void> = [];
+    const server = createIpcServer({
+      socketPath,
+      awaitReady: async () => {
+        await new Promise<void>((resolve) => { gates.push(resolve); });
+        return true;
+      },
+    });
+    await server.start();
+    try {
+      const old = await dial(socketPath);
+      send(old, { type: "control", action: "register", clientId: "replacement" });
+      assert.ok(await waitFor(() => gates.length === 1));
+      send(old, { type: "control", action: "register", clientId: "second-id" });
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      assert.equal(gates.length, 1, "one socket may reserve only one identity");
+      old.socket.destroy();
+      assert.ok(await waitFor(() => server.socketCount() === 0));
+      const replacement = await dial(socketPath);
+      send(replacement, { type: "control", action: "register", clientId: "replacement" });
+      assert.ok(await waitFor(() => gates.length === 2));
+      gates[0]?.();
+      await new Promise<void>((resolve) => { setImmediate(resolve); });
+      gates[1]?.();
+      assert.ok(await waitFor(() => replacement.received.some((m) => m.type === "control" && m.action === "registered")));
+      assert.equal(server.clientCount(), 1);
+      replacement.socket.destroy();
+    } finally {
+      for (const release of gates) release();
+      await server.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   test("every registered disconnect handler runs, and a disposed one does not", async () => {
     const h = await startServer();
     try {
@@ -196,6 +232,94 @@ describe("daemon ipc server", { skip: SKIP }, () => {
       client.socket.destroy();
     } finally {
       await h.dispose();
+    }
+  });
+
+  test("P5-4: concurrent registrations with same clientId during awaitReady are atomically rejected", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pbh-server-conc-"));
+    const socketPath = join(dir, "d.sock");
+    let readyBlocked = true;
+    let readyResolved: () => void = () => undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      readyResolved = resolve;
+    });
+
+    const server = createIpcServer({
+      socketPath,
+      awaitReady: async () => {
+        if (readyBlocked) await readyPromise;
+        return true;
+      },
+      provenance: () => readyBlocked ? undefined : { browserId: "b-conc", userDataDir: "/tmp/u", cdpUrl: "ws://conc" },
+    });
+    await server.start();
+
+    try {
+      const c1 = await dial(socketPath);
+      const c2 = await dial(socketPath);
+
+      send(c1, { type: "control", action: "register", clientId: "same-id" });
+      send(c2, { type: "control", action: "register", clientId: "same-id" });
+
+      assert.ok(await waitFor(() => c2.closed()), "second concurrent client was closed as duplicate");
+      const c2Reply = c2.received.find((m) => m.type === "control" && m.action === "shutdown");
+      assert.ok(c2Reply);
+      assert.match(c2Reply.reason ?? "", /already connected/);
+
+      readyBlocked = false;
+      readyResolved();
+
+      assert.ok(
+        await waitFor(() => c1.received.some((m) => m.type === "control" && m.action === "registered")),
+        "first client completes registration",
+      );
+      assert.equal(server.clientCount(), 1);
+
+      c1.socket.destroy();
+    } finally {
+      await server.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("P5-4: socket disconnection during awaitReady cleans up reservation allowing subsequent registration", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pbh-server-disc-"));
+    const socketPath = join(dir, "d.sock");
+    let readyBlocked = true;
+    let readyResolved: () => void = () => undefined;
+    const readyPromise = new Promise<void>((resolve) => {
+      readyResolved = resolve;
+    });
+
+    const server = createIpcServer({
+      socketPath,
+      awaitReady: async () => {
+        if (readyBlocked) await readyPromise;
+        return true;
+      },
+      provenance: () => readyBlocked ? undefined : { browserId: "b-disc" },
+    });
+    await server.start();
+
+    try {
+      const c1 = await dial(socketPath);
+      send(c1, { type: "control", action: "register", clientId: "disconnect-id" });
+
+      await sleep(10);
+      c1.socket.destroy();
+
+      readyBlocked = false;
+      readyResolved();
+      await sleep(10);
+
+      assert.equal(server.clientCount(), 0);
+
+      const c2 = await register(socketPath, "disconnect-id");
+      assert.equal(server.clientCount(), 1);
+      c2.socket.destroy();
+    } finally {
+      await server.stop();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

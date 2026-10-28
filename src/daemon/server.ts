@@ -7,7 +7,7 @@ import {
   type WireControl,
   deserialize,
   serialize,
-  DAEMON_SOCKET_PATH,
+  daemonSocketPath,
   DAEMON_MAX_CLIENTS,
 } from "./protocol";
 
@@ -27,6 +27,8 @@ export type Disposer = () => void;
 export type IpcServerOptions = {
   readonly socketPath?: string;
   readonly maxClients?: number;
+  readonly provenance?: () => { readonly browserId?: string; readonly userDataDir?: string; readonly cdpUrl?: string } | undefined;
+  readonly awaitReady?: (timeoutMs: number) => Promise<boolean>;
 };
 
 export type IpcServer = {
@@ -51,12 +53,13 @@ const listen = <H>(handlers: Set<H>) => (handler: H): Disposer => {
 
 
 export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
-  const socketPath = options.socketPath ?? DAEMON_SOCKET_PATH;
+  const socketPath = options.socketPath ?? daemonSocketPath();
   const maxClients = options.maxClients ?? DAEMON_MAX_CLIENTS;
   let server: Server | null = null;
   // Sockets that have not registered yet, by their temporary id.
   const anonymous = new Map<string, ClientSocket>();
   const clients = new Map<string, ClientSocket>();
+  const reserving = new Map<string, ClientSocket>();
   const messageHandlers = new Set<MessageHandler>();
   const connectHandlers = new Set<ConnectionHandler>();
   const disconnectHandlers = new Set<ConnectionHandler>();
@@ -73,6 +76,9 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
 
   // A registered client leaves exactly once: either its socket closes or it deregisters first.
   const forget = (client: ClientSocket): void => {
+    for (const [id, c] of reserving) {
+      if (c === client) reserving.delete(id);
+    }
     if (!client.registered) return;
     client.registered = false;
     clients.delete(client.id);
@@ -94,16 +100,18 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
         const client: ClientSocket = { id: tempId, socket, stopReading, registered: false };
 
         anonymous.set(tempId, client);
+        let registrationPending = false;
 
         function onLine(line: string): void {
           const msg = deserialize(line);
           if (!msg) return;
 
           if (msg.type === "control" && msg.action === "register") {
-            if (client.registered) return;
+            if (client.registered || registrationPending) return;
+            registrationPending = true;
             const clientId = msg.clientId;
 
-            if (clients.has(clientId)) {
+            if (clients.has(clientId) || reserving.has(clientId)) {
               const reply: WireControl = {
                 type: "control",
                 action: "shutdown",
@@ -114,16 +122,57 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
               return;
             }
 
-            // Mutate in place so the already-captured closure sees the promoted client.
-            anonymous.delete(tempId);
-            client.id = clientId;
-            client.registered = true;
-            clients.set(clientId, client);
+            reserving.set(clientId, client);
 
-            const ack: WireControl = { type: "control", action: "registered", clientId };
-            socket.write(serialize(ack) + "\n");
+            // Separate daemon IPC liveness from Chrome readiness:
+            // Liveness probes need only test that the daemon is listening; they must not block on Chrome
+            if (clientId.startsWith("_liveness_probe")) {
+              reserving.delete(clientId);
+              anonymous.delete(tempId);
+              client.id = clientId;
+              client.registered = true;
+              clients.set(clientId, client);
 
-            for (const h of connectHandlers) h(client);
+              const ack: WireControl = { type: "control", action: "registered", clientId };
+              socket.write(serialize(ack) + "\n");
+
+              for (const h of connectHandlers) h(client);
+              return;
+            }
+
+            const finishRegistration = async (): Promise<void> => {
+              try {
+                if (options.awaitReady && !options.provenance?.()) {
+                  await options.awaitReady(5_000);
+                }
+              } catch {
+                // Readiness timeout or failure must not crash server
+              }
+              if (socket.destroyed || reserving.get(clientId) !== client) {
+                if (reserving.get(clientId) === client) reserving.delete(clientId);
+                return;
+              }
+              reserving.delete(clientId);
+              anonymous.delete(tempId);
+              client.id = clientId;
+              client.registered = true;
+              clients.set(clientId, client);
+
+              const prov = options.provenance?.();
+              const ack: WireControl = {
+                type: "control",
+                action: "registered",
+                clientId,
+                ...(prov?.browserId !== undefined ? { browserId: prov.browserId } : {}),
+                ...(prov?.userDataDir !== undefined ? { userDataDir: prov.userDataDir } : {}),
+                ...(prov?.cdpUrl !== undefined ? { cdpUrl: prov.cdpUrl } : {}),
+              };
+              socket.write(serialize(ack) + "\n");
+
+              for (const h of connectHandlers) h(client);
+            };
+
+            void finishRegistration();
             return;
           }
 

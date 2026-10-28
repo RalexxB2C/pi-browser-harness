@@ -1,9 +1,15 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { seedProfileWindow, type SeedDeps } from "../../src/profile/bind";
+import { seedProfileWindow, unlinkedEndpointHint, type SeedDeps } from "../../src/profile/bind";
 import type { BrowserClient } from "../../src/client";
 import type { ProfilePin } from "../../src/profile/store";
-import type { RunningBrowser } from "../../src/profile/browser-process";
+import {
+  type RunningBrowser,
+  type BrowserCandidate,
+  selectBrowserCandidate,
+  parseProcCmdline,
+  userDataDirFromArgv,
+} from "../../src/profile/browser-process";
 import type { ProfileWindowRequest } from "../../src/profile/launch";
 import { cdpError } from "../../src/cdp/errors";
 import { err, ok } from "../../src/util/result";
@@ -48,10 +54,16 @@ const seeded = async (opts: {
   readonly exePath?: string | undefined;
   readonly launchError?: string;
   readonly deadlineMs?: number;
+  readonly userDataDir?: string | undefined;
 } = {}): Promise<Seeded> => {
   const fake = await createFakeClient(opts.canned === undefined ? {} : { canned: opts.canned });
   const contexts: Array<string | undefined> = [];
-  const client: BrowserClient = { ...fake.client, setProfileContextId: (id) => { contexts.push(id); } };
+  const client: BrowserClient = {
+    ...fake.client,
+    userDataDir: () => "userDataDir" in opts ? opts.userDataDir : pin.userDataDir,
+    profilePin: () => pin,
+    setProfileContextId: (id) => { contexts.push(id); },
+  };
   const launches: ProfileWindowRequest[] = [];
   const detects: Array<string | undefined> = [];
   const sleeps: number[] = [];
@@ -61,7 +73,10 @@ const seeded = async (opts: {
   const running: RunningBrowser = opts.running ?? { running: true, exePath: EXE };
   const deps: SeedDeps = {
     detectRunningBrowser: (prefer) => { detects.push(prefer); return Promise.resolve(running); },
-    resolveBrowserExecutable: () => Promise.resolve("exePath" in opts ? opts.exePath : EXE),
+    resolveBrowserExecutable: (r) => {
+      if (r?.ambiguous) return Promise.resolve(undefined);
+      return Promise.resolve("exePath" in opts ? opts.exePath : r?.exePath ?? EXE);
+    },
     openProfileWindow: (req) => {
       launches.push(req);
       if (opts.launchError !== undefined) return Promise.resolve(err(opts.launchError));
@@ -209,6 +224,150 @@ describe("seedProfileWindow", () => {
     assert.match(r.error.message, /browser profile menu → Profile 1/);
     assert.deepEqual(s.launches, []);
     assert.equal(s.fake.calls.length, 0);
+  });
+
+  test("ambiguous browser candidates produce a precise error and zero launches before spawn", async () => {
+    const s = await seeded({
+      running: {
+        running: true,
+        ambiguous: true,
+        error: "ambiguous browser identity: multiple candidates (/opt/google/chrome/chrome, /home/u/.agent-browser/browsers/chrome-150/chrome) found without an explicit user-data-dir flag for /home/u/.config/google-chrome",
+      },
+    });
+    const r = await seedProfileWindow(s.client, pin, s.deps);
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /could not verify browser identity/i);
+    assert.match(r.error.message, /ambiguous browser identity/i);
+    assert.match(r.error.message, /browser profile menu → Profile 1/);
+    assert.deepEqual(s.launches, [], "zero launches on ambiguous identity");
+    assert.equal(s.fake.calls.length, 0, "no CDP calls on ambiguous identity");
+  });
+
+  test("ambiguous candidate processes with absent flags in both candidate orders produce zero launches", async () => {
+    const chromeCandidate: BrowserCandidate = { exePath: "/opt/google/chrome/chrome" };
+    const cftCandidate: BrowserCandidate = { exePath: "/home/u/.agent-browser/browsers/chrome-150/chrome" };
+
+    // Order 1: [Chrome, CFT]
+    const s1 = await seeded({
+      running: selectBrowserCandidate([chromeCandidate, cftCandidate], pin.userDataDir),
+    });
+    const r1 = await seedProfileWindow(s1.client, pin, s1.deps);
+    assert.equal(r1.success, false);
+    assert.equal(r1.error.kind, "discovery_failed");
+    assert.match(r1.error.message, /ambiguous/i);
+    assert.deepEqual(s1.launches, [], "order 1 produces zero launches");
+
+    // Order 2: [CFT, Chrome]
+    const s2 = await seeded({
+      running: selectBrowserCandidate([cftCandidate, chromeCandidate], pin.userDataDir),
+    });
+    const r2 = await seedProfileWindow(s2.client, pin, s2.deps);
+    assert.equal(r2.success, false);
+    assert.equal(r2.error.kind, "discovery_failed");
+    assert.match(r2.error.message, /ambiguous/i);
+    assert.deepEqual(s2.launches, [], "order 2 produces zero launches");
+  });
+
+  test("sole CFT candidate without explicit user-data-dir flag fails closed before spawn with zero launches", async () => {
+    const cftCandidate: BrowserCandidate = { exePath: "/home/u/.agent-browser/browsers/chrome-150/chrome" };
+    const s = await seeded({
+      running: selectBrowserCandidate([cftCandidate], pin.userDataDir),
+    });
+    const r = await seedProfileWindow(s.client, pin, s.deps);
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /ambiguous/i);
+    assert.deepEqual(s.launches, [], "zero launches for sole CFT candidate without explicit flag");
+    assert.equal(s.fake.calls.length, 0);
+  });
+
+  test("unknown endpoint (client has no verified user-data-dir) fails closed before spawn with zero launches", async () => {
+    const s = await seeded({ userDataDir: undefined });
+    const r = await seedProfileWindow(s.client, pin, s.deps);
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /no verified user-data-dir endpoint linkage/i);
+    assert.match(r.error.message, /cannot be proven to belong to/i);
+    assert.match(r.error.message, /\/browser-setup/);
+    assert.match(r.error.message, /\/browser-profile/);
+    assert.ok(r.error.message.includes(unlinkedEndpointHint(pin)));
+    assert.deepEqual(s.launches, [], "zero launches on unverified endpoint");
+    assert.equal(s.fake.calls.length, 0);
+  });
+
+  test("mismatched running explicit user-data-dir produces a precise error and zero launches before spawn", async () => {
+    const s = await seeded({
+      running: {
+        running: true,
+        exePath: EXE,
+        explicitUserDataDir: "/home/u/.config/BraveSoftware/Brave-Browser",
+      },
+    });
+    const r = await seedProfileWindow(s.client, pin, s.deps);
+    assert.equal(r.success, false);
+    assert.equal(r.error.kind, "discovery_failed");
+    assert.match(r.error.message, /user-data-dir/i);
+    assert.match(r.error.message, /does not match the pinned profile/i);
+    assert.deepEqual(s.launches, [], "zero launches on directory mismatch");
+    assert.equal(s.fake.calls.length, 0);
+  });
+
+  for (const kernelVerified of [false, true]) {
+    test(`verified identity permits service-window launch with ${kernelVerified ? "kernel socket ownership" : "explicit flag"}`, async () => {
+      const chromeCandidate: BrowserCandidate = {
+        exePath: EXE,
+        ...(kernelVerified ? { verifiedUserDataDir: pin.userDataDir } : { explicitUserDataDir: pin.userDataDir }),
+      };
+      const cftCandidate: BrowserCandidate = {
+        exePath: "/home/u/.agent-browser/browsers/chrome-150/chrome",
+      };
+      const s = await seeded({
+        running: selectBrowserCandidate([cftCandidate, chromeCandidate], pin.userDataDir),
+        canned: {
+          "Target.getTargets": [
+            ok({ targetInfos: [page("t1", "https://example.test/")] }),
+            ok({ targetInfos: [page("seed", SENTINEL, "ctx-1")] }),
+          ],
+          "Target.attachToTarget": [ok({ sessionId: "s1" }), ok({ sessionId: "s-seed" })],
+          "Browser.getWindowForTarget": [ok({ windowId: 7 }), ok({ windowId: 42 })],
+        },
+      });
+      const r = await seedProfileWindow(s.client, pin, s.deps);
+      assert.ok(r.success, r.success ? "" : r.error.message);
+      assert.deepEqual(s.launches, [{
+        exePath: EXE,
+        profileDir: "Profile 1",
+        explicitUserDataDir: pin.userDataDir,
+      }]);
+    });
+  }
+
+  test("verified positive identity with rewritten process-title explicit flag permits launch", async () => {
+    const argv = parseProcCmdline(`${EXE} --user-data-dir=${pin.userDataDir}\0`);
+    const explicit = userDataDirFromArgv(argv);
+    assert.equal(explicit, pin.userDataDir);
+    const s = await seeded({
+      running: selectBrowserCandidate([
+        { exePath: "/home/u/.agent-browser/browsers/chrome-150/chrome" },
+        { exePath: EXE, explicitUserDataDir: explicit },
+      ], pin.userDataDir),
+      canned: {
+        "Target.getTargets": [
+          ok({ targetInfos: [page("t1", "https://example.test/")] }),
+          ok({ targetInfos: [page("seed", SENTINEL, "ctx-1")] }),
+        ],
+        "Target.attachToTarget": [ok({ sessionId: "s1" }), ok({ sessionId: "s-seed" })],
+        "Browser.getWindowForTarget": [ok({ windowId: 7 }), ok({ windowId: 42 })],
+      },
+    });
+    const r = await seedProfileWindow(s.client, pin, s.deps);
+    assert.ok(r.success);
+    assert.deepEqual(s.launches, [{
+      exePath: EXE,
+      profileDir: "Profile 1",
+      explicitUserDataDir: pin.userDataDir,
+    }]);
   });
 
   test("a failed launch is a discovery failure carrying the launcher's reason", async () => {

@@ -144,11 +144,19 @@ export const endpointFromEnv = (env: NodeJS.ProcessEnv = process.env): CdpEndpoi
   return wsUrl ? { wsUrl } : undefined;
 };
 
-export const discoverEndpoint = async (): Promise<Result<CdpEndpoint, CdpError>> => {
+export type DiscoveryDeps = {
+  readonly userDataDirCandidates?: () => ReadonlyArray<string>;
+  readonly isPortLive?: (port: number) => Promise<boolean>;
+  readonly queryLiveWsUrl?: (port: number) => Promise<string | null>;
+};
+
+export const discoverEndpoint = async (deps: DiscoveryDeps = {}): Promise<Result<CdpEndpoint, CdpError>> => {
   const override = endpointFromEnv();
   if (override) return ok(override);
 
-  const dirs = userDataDirCandidates();
+  const dirs = (deps.userDataDirCandidates ?? userDataDirCandidates)();
+  const isPortLiveFn = deps.isPortLive ?? isPortLive;
+  const queryLiveWsUrlFn = deps.queryLiveWsUrl ?? queryLiveWsUrl;
 
   const candidates: Candidate[] = [];
   const readErrors: string[] = [];
@@ -206,15 +214,28 @@ export const discoverEndpoint = async (): Promise<Result<CdpEndpoint, CdpError>>
   }
   const unique = Array.from(byPort.values());
 
-  const liveChecks = await Promise.all(unique.map((c) => isPortLive(c.port)));
+  const liveChecks = await Promise.all(unique.map((c) => isPortLiveFn(c.port)));
   const liveCandidates = unique.filter((_, i) => liveChecks[i]);
   const ordered = liveCandidates.length > 0 ? liveCandidates : unique;
 
   // Some browsers disable the /json/version endpoint when remote debugging is toggled via chrome://inspect rather than a launch flag, hence the DevToolsActivePort fallback.
-  const ready = await firstReadyPort(ordered);
+  const ready = await firstReadyPort(ordered, { probe: (port) => isPortLiveFn(port).then((live) => live ? ok(undefined) : err(cdpError("discovery_failed", "ECONNREFUSED"))) });
   if (ready.success) {
     const c = ready.data;
-    const liveUrl = await queryLiveWsUrl(c.port);
+    const liveUrl = await queryLiveWsUrlFn(c.port);
+    if (liveUrl) {
+      try {
+        const livePath = new URL(liveUrl).pathname;
+        const portFilePath = c.path.startsWith("/") ? c.path : `/${c.path}`;
+        if (livePath !== portFilePath) {
+          // Stale DevToolsActivePort: the live endpoint on this port does not match the file's browser path.
+          // Fail closed regarding directory linkage: do not pair this endpoint with an unverified user-data-dir.
+          return ok({ wsUrl: liveUrl });
+        }
+      } catch {
+        return ok({ wsUrl: liveUrl });
+      }
+    }
     return ok({ wsUrl: liveUrl ?? `ws://127.0.0.1:${c.port}${c.path}`, userDataDir: c.userDataDir });
   }
 
