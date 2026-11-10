@@ -12,7 +12,9 @@ import {
   buildTree,
   collectInteractiveTargets,
   countNodes,
+  firstNodes,
   INTERACTIVE_ROLES,
+  keepOnly,
   liveValue,
   type SlimNode,
   stripInternals,
@@ -113,7 +115,7 @@ export const snapshotTool = defineBrowserTool({
   name: "browser_snapshot",
   label: "Browser Snapshot",
   description:
-    "DEFAULT tool for understanding what is on the page. Returns the structured accessibility tree (roles, names, states, hierarchy). Every interactive element gets a stable ref shown as [eN] plus click coordinates @(x,y). Pass the ref to browser_click/browser_fill/etc. — refs survive re-renders, coordinates don't. Use this BEFORE deciding whether you need a screenshot. Pair with browser_execute_js for surgical reads of specific element values.",
+    "DEFAULT tool for understanding what is on the page. Returns the structured accessibility tree (roles, names, states, hierarchy). Every interactive element gets a stable ref shown as [eN] plus click coordinates @(x,y). Pass the ref to browser_click/browser_type/etc. — refs survive re-renders, coordinates don't. Use this BEFORE deciding whether you need a screenshot. Pair with browser_execute_js for surgical reads of specific element values.",
   promptSnippet: "Get accessibility-tree snapshot with stable element refs (default for page inspection)",
   promptGuidelines: [
     "Re-run browser_snapshot after a navigation or a major re-render to get fresh refs.",
@@ -136,12 +138,12 @@ export const snapshotTool = defineBrowserTool({
     const pageUrl = piRes.data.kind === "dialog" ? "" : piRes.data.url;
     const pageTitle = piRes.data.kind === "dialog" ? "" : piRes.data.title;
 
-    const slim = buildTree(rawNodes, {
-      interestingOnly: args.interestingOnly ?? true,
-      maxNodes: args.maxNodes ?? 1000,
-    });
+    // Every element gets a ref, so a tool or a recipe can reach one the shown outline cut off; maxNodes limits
+    // only what is shown.
+    const full = buildTree(rawNodes, { interestingOnly: args.interestingOnly ?? true, maxNodes: Number.POSITIVE_INFINITY });
+    const shown = firstNodes(full, args.maxNodes ?? 1000);
 
-    const targets = collectInteractiveTargets(slim);
+    const targets = collectInteractiveTargets(full);
 
     const refMap = new Map<string, number>();
     targets.forEach(({ node, backendId }, i) => {
@@ -153,7 +155,8 @@ export const snapshotTool = defineBrowserTool({
     if (targets.length > 0) {
       // Geometry and live values are best-effort decoration: whatever lands inside the budget is kept, the rest is omitted.
       const deadline = deadlineSignal(BOX_BUDGET_MS, signal);
-      await runLimited(targets, { limit: BOX_CONCURRENCY, signal: deadline.signal }, async ({ node, backendId }, sig) => {
+      const visible = targets.filter(({ node }) => shown.has(node));
+      await runLimited(visible, { limit: BOX_CONCURRENCY, signal: deadline.signal }, async ({ node, backendId }, sig) => {
         const box = await boxOf(client, backendId);
         if (!box.success || sig.aborted) return;
         if (box.data.x < 0 || box.data.y < 0) return;
@@ -171,6 +174,8 @@ export const snapshotTool = defineBrowserTool({
       refSig.set(node.ref, signatureOf(node));
     }
     session.setRefMap(refMap, refSig);
+
+    const slim = keepOnly(full, shown);
 
     const text = (args.format ?? "outline") === "outline" ? renderOutline(slim) : JSON.stringify(stripInternals(slim), null, 2);
     const trunc = await applyTruncation(text, "snapshot");

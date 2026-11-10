@@ -798,7 +798,10 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     });
 
     const inFlightStart = client.start();
-    await new Promise((r) => setTimeout(r, 10));
+    // The seed passes several awaits, so wait for it to reach the launch instead of racing a fixed delay.
+    for (let waited = 0; launches.length === 0 && waited < 2_000; waited += 5) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
     assert.equal(launches.length, 1);
 
     client.setProfilePin(defaultPin);
@@ -933,7 +936,10 @@ describe("BrowserClient ticket #10: safe target reuse in fresh clients", () => {
     });
 
     const inFlightStart = client.start();
-    await new Promise((r) => setTimeout(r, 10));
+    // The seed passes several awaits, so wait for it to reach the launch instead of racing a fixed delay.
+    for (let waited = 0; launches.length === 0 && waited < 2_000; waited += 5) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
     assert.equal(launches.length, 1);
 
     client.setProfilePin(null);

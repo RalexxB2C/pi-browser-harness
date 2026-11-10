@@ -5,7 +5,8 @@ import { parseJson } from "./schemas/parse";
 import { type Result, err, ok } from "./util/result";
 import { safeJs } from "./util/js-template";
 import { type Mutex, createMutex } from "./util/mutex";
-import { discoverEndpoint, type CdpEndpoint } from "./cdp/discovery";
+import { type CdpEndpoint, discoverEndpoint, isLoopbackWsUrl } from "./cdp/discovery";
+import { isBrowserRunning } from "./profile/browser-process";
 import { type CdpError, cdpError } from "./cdp/errors";
 import type { CdpTransport } from "./cdp/types";
 import { type CdpSession, createCdpSession } from "./cdp/session";
@@ -14,6 +15,21 @@ import { ensureHarnessWindow, openHarnessTab } from "./cdp/target-factory";
 import { seedProfileWindow, type SeedDeps, verifyConnectedBrowserIdentity } from "./profile/bind";
 import type { ProfilePin } from "./profile/store";
 import type { DaemonStatus, DialogInfo, PageInfo, PageInfoResult, TabInfo } from "./cdp/types";
+import { pageExpression } from "./util/js-source";
+
+// REPL mode lets a later call declare the same const or let again, as the console does.
+export const evaluateParams = (
+  expression: string,
+): { readonly expression: string; readonly returnByValue: true; readonly awaitPromise: true; readonly replMode: true } => ({
+  expression: pageExpression(expression),
+  returnByValue: true,
+  awaitPromise: true,
+  replMode: true,
+});
+
+const CLOSE_ATTEMPTS = 2;
+const CLOSE_CONFIRM_MS = 2_500;
+const CLOSE_POLL_MS = 100;
 
 export type ProfileContext =
   | { readonly kind: "unresolved" }
@@ -40,6 +56,11 @@ export type BrowserClientOptions = {
     readonly profileContextId?: string;
   };
   readonly profilePin?: ProfilePin | null;
+  // How long one close may take to show in Chrome's target list before it is sent again; tests shorten it.
+  readonly closeConfirmMs?: number;
+  // How start() finds the browser and decides whether it is on this machine. Each defaults to the real one.
+  readonly discoverEndpoint?: () => Promise<Result<CdpEndpoint, CdpError>>;
+  readonly isBrowserRunning?: () => Promise<boolean>;
   readonly onOwnershipChange?: (snapshot: {
     readonly browserId?: string | undefined;
     readonly userDataDir?: string | undefined;
@@ -50,7 +71,6 @@ export type BrowserClientOptions = {
     readonly profileContext?: ProfileContext | undefined;
   }) => void;
   readonly seedDeps?: SeedDeps;
-  readonly discoverEndpoint?: () => Promise<Result<CdpEndpoint, CdpError>>;
 };
 
 export type BrowserClient = {
@@ -65,7 +85,7 @@ export type BrowserClient = {
   stop(): Promise<void>;
   detach(): Promise<void>;
   closeOwnedTabs(): Promise<void>;
-  evaluateJs(expression: string, sessionId?: string): Promise<Result<unknown, CdpError>>;
+  evaluateJs(expression: string, sessionId?: string, opts?: { readonly timeoutMs?: number }): Promise<Result<unknown, CdpError>>;
   pageInfo(): Promise<Result<PageInfoResult, CdpError>>;
   takeDialog(): DialogInfo | null;
   listTabs(includeInternal?: boolean): Promise<Result<ReadonlyArray<TabInfo>, CdpError>>;
@@ -194,12 +214,18 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
   let remote: BrowserClientOptions["remote"] | null = opts.remote ?? null;
   let userDataDir: string | undefined;
   let profilePin: ProfilePin | null = opts.profilePin ?? null;
+  // A pin names a profile on this machine's disk and is applied by launching this machine's browser, so it is suspended (kept, not cleared) while the connected browser is somewhere else.
+  let pinSuspended = false;
+  const activePin = (): ProfilePin | null => (pinSuspended ? null : profilePin);
+  const discover = opts.discoverEndpoint ?? discoverEndpoint;
+  const localBrowserRunning = opts.isBrowserRunning ?? isBrowserRunning;
 
   transport.onClose(() => {
     // Lost endpoint evidence invalidates in-flight profile work even when the pin is unchanged.
     pinGeneration++;
     userDataDir = undefined;
     remote = null;
+    pinSuspended = false;
   });
 
   let registryProvenance: {
@@ -216,7 +242,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
 
   // With a pin set the window must exist BEFORE anything attaches, or attachFirstPage's bare Target.createTarget lands in the focus-derived default profile.
   const seedIfPinned = async (): Promise<Result<void, CdpError>> => {
-    if (!profilePin) return ok(undefined);
+    if (!activePin()) return ok(undefined);
     const window = await ensureHarnessWindow(api);
     if (!window.success) return window;
     return ok(undefined);
@@ -234,13 +260,15 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     if (opts.remote?.cdpUrl) {
       wsUrl = opts.remote.cdpUrl;
     } else {
-      const discover = opts.discoverEndpoint ?? discoverEndpoint;
       const discovered = await discover();
       if (!discovered.success) {
         latchedInitFailure = discovered.error;
         return discovered;
       }
       wsUrl = discovered.data.wsUrl;
+      userDataDir = discovered.data.userDataDir;
+      // No user-data-dir means the endpoint did not come from a port file here. It is remote if it names another host, or if no browser process runs on this machine either.
+      pinSuspended = userDataDir === undefined && (!isLoopbackWsUrl(wsUrl) || !(await localBrowserRunning()));
     }
     const connected = await transport.connect(wsUrl, { timeoutMs: 10_000 });
     if (!connected.success) {
@@ -445,19 +473,21 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     return running;
   };
 
-  const evaluateJs = async (expression: string, sessionId?: string): Promise<Result<unknown, CdpError>> => {
+  const evaluateJs = async (
+    expression: string,
+    sessionId?: string,
+    opts?: { readonly timeoutMs?: number },
+  ): Promise<Result<unknown, CdpError>> => {
     if (latchedInitFailure) return err(latchedInitFailure);
     if (!sessionId && !session.current()) {
       const alive = await ensureAlive();
       if (!alive.success) return alive;
     }
-    // Wrap only when the trimmed source *starts with* `return` — matching the substring anywhere silently turned expressions mentioning it into `undefined`.
-    const trimmed = expression.trim();
-    const isReturnStatement = /^return[\s(]/.test(trimmed);
-    const wrapped = isReturnStatement ? `(function(){${expression}})()` : expression;
+    const params = evaluateParams(expression);
+    const callOpts = opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {};
     const r = sessionId
-      ? await session.callOnTarget("Runtime.evaluate", { expression: wrapped, returnByValue: true, awaitPromise: true }, sessionId)
-      : await session.call("Runtime.evaluate", { expression: wrapped, returnByValue: true, awaitPromise: true });
+      ? await session.callOnTarget("Runtime.evaluate", params, sessionId, callOpts)
+      : await session.call("Runtime.evaluate", params, callOpts);
     if (!r.success) return r;
     if (r.data.exceptionDetails !== undefined) {
       return err(cdpError("remote_error", `JS evaluation failed: ${JSON.stringify(r.data.exceptionDetails)}`, "Runtime.evaluate"));
@@ -548,12 +578,40 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     return ok(tabId);
   };
 
+  // True once Chrome no longer lists the target, false if it still does at the deadline, undefined when the list
+  // cannot be read (then the close is taken at its word, as before).
+  const targetGone = async (targetId: string, timeoutMs: number): Promise<boolean | undefined> => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const r = await session.callBrowser("Target.getTargets", {}, { timeoutMs: 2_000 });
+      if (!r.success) return undefined;
+      if (!r.data.targetInfos.some((t) => t.targetId === targetId)) return true;
+      if (Date.now() >= deadline) return false;
+      await new Promise((resolve) => setTimeout(resolve, CLOSE_POLL_MS));
+    }
+  };
+
+  // Chrome answers Target.closeTarget with success even when it then keeps the tab: a tab closed while its page is
+  // still loading stays open. So the close is checked against Chrome's own target list and sent once more if the
+  // tab is still there; the tab leaves the owned list only once it is gone, so a tab left open is not lost track of.
   const closeTab = async (targetId: string): Promise<Result<void, CdpError>> => {
     if (latchedInitFailure) return err(latchedInitFailure);
-    const r = await session.callBrowser("Target.closeTarget", { targetId });
-    if (!r.success) return r;
-    ownership.remove(targetId);
-    return ok(undefined);
+    for (let attempt = 1; attempt <= CLOSE_ATTEMPTS; attempt++) {
+      const r = await session.callBrowser("Target.closeTarget", { targetId });
+      if (!r.success) return r;
+      const gone = await targetGone(targetId, opts.closeConfirmMs ?? CLOSE_CONFIRM_MS);
+      if (gone !== false) {
+        ownership.remove(targetId);
+        return ok(undefined);
+      }
+    }
+    return err(
+      cdpError(
+        "timeout",
+        `Chrome accepted the close but tab ${targetId} is still open after ${CLOSE_ATTEMPTS} attempts (a page that is still loading can ignore a close); wait for it to load, then close it again`,
+        "Target.closeTarget",
+      ),
+    );
   };
 
   const closeOwnedTabs = async (): Promise<void> => {
@@ -590,7 +648,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     session: () => session,
     transport: () => transport,
     userDataDir: () => userDataDir,
-    profilePin: () => profilePin,
+    profilePin: activePin,
     profileGeneration: () => pinGeneration,
     setProfilePin: (pin) => {
       const changed = !samePin(profilePin, pin);
@@ -634,11 +692,12 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     },
     seedPinnedProfileWindow: async () => {
       if (latchedInitFailure && !inExplicitRetry) return err(latchedInitFailure);
-      if (!profilePin) {
+      const pin = activePin();
+      if (!pin) {
         return err(cdpError("discovery_failed", "no browser profile is selected — run /browser-profile"));
       }
       const myGen = pinGeneration;
-      const r = await seedProfileWindow(api, profilePin, opts.seedDeps, () => pinGeneration === myGen);
+      const r = await seedProfileWindow(api, pin, opts.seedDeps, () => pinGeneration === myGen);
       if (pinGeneration !== myGen) {
         const genErr = cdpError("discovery_failed", "profile pin changed during initialization");
         latchedInitFailure = genErr;

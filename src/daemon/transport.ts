@@ -222,6 +222,7 @@ export const createDaemonTransport = (clientId: string, socketPath: string = dae
       method,
       params,
       ...(sessionId !== null ? { sessionId } : {}),
+      ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
     };
 
     return sendWithTimeout(pending, id, method, timeoutMs, "Daemon", () => sock.write(serialize(req) + "\n"));

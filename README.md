@@ -18,7 +18,7 @@ no MCP hop, no second browser, no extra API keys.
 | **Browser** | Your running Chrome — real profile, live sessions | Launches a clean instance | Launches a clean instance | Launches a clean instance |
 | **Element targeting** | AX-tree refs (`[eN]`) that re-resolve at action time; coordinate and selector fallbacks | Selectors / AX locators | CSS selectors | LLM-inferred selectors |
 | **Input dispatch** | Compositor-level CDP input — works through iframes, shadow DOM, cross-origin frames | DOM-level | DOM-level | DOM-level |
-| **Framework-safe writes** | `browser_fill` writes via the native setter and fires bubbling events, so controlled inputs keep the value | Native fill | Manual | Native fill |
+| **Framework-safe writes** | `browser_type` types with real input events, reads the value back, and falls back to the native setter when typing doesn't take | Native fill | Manual | Native fill |
 | **Transport** | Native pi extension, in-process | MCP / JSON-RPC round trip | MCP / JSON-RPC round trip | In-process + its own LLM calls |
 | **Extra credentials** | None | None | None | Its own model API key |
 | **Concurrency** | Reads run in parallel; mutations auto-serialize through a shared mutex | Sequential | Sequential | Sequential |
@@ -78,10 +78,12 @@ interactive element carries a stable ref (`[eN]`) plus click coordinates `@(x,y)
 [e12] button   "Create account" @(456,412)
 ```
 
-Pass the ref — not the coordinates — to `browser_click`, `browser_fill`, `browser_select_option`,
+Pass the ref — not the coordinates — to `browser_click`, `browser_type`, `browser_select_option`,
 `browser_focus`, `browser_upload_file`, or `browser_dispatch_key`. Refs are keyed to element
 identity, so they re-resolve position at action time and survive the re-renders that SPA forms
-trigger on every keystroke. Coordinates go stale the moment the layout reflows.
+trigger on every keystroke. Coordinates go stale the moment the layout reflows. `browser_click` by ref
+scrolls the element into view first (inside scrolling lists too) and warns when something covers it;
+an `x`/`y` outside the viewport is refused instead of clicking nothing.
 
 Three things follow from that:
 
@@ -119,7 +121,7 @@ Three things follow from that:
 
 | Tool | Purpose |
 |---|---|
-| `browser_web_search` | Query → ranked `{title, url, snippet, rank}`, by scraping a real Google SERP in your Chrome. No API key. Links only. |
+| `browser_web_search` | Query → ranked `{title, url, snippet, rank}`, by scraping a real search results page in your Chrome. No API key. Links only. Walks the fallback ladder Google → Bing → DuckDuckGo → Brave until one answers, or searches only the `engine` you name. |
 | `browser_read_page` | Reader mode. A `url` (opened and closed in its own tab) or an owned `targetId` → clean article text, boilerplate stripped. |
 
 Both run in isolated tabs and never disturb your current page.
@@ -129,10 +131,9 @@ Both run in isolated tabs and never disturb your current page.
 | Tool | Purpose |
 |---|---|
 | `browser_click` | Click by `ref` (preferred) or viewport `x`/`y`. Compositor-level, so iframes and shadow DOM work. |
-| `browser_fill` | Set an input, textarea, or contenteditable. Fires bubbling `input`/`change`, returns the value written. |
 | `browser_select_option` | Choose in a native `<select>` by value, label, or index. Returns available options on no match. |
 | `browser_focus` | Deterministic `.focus()` — no coordinate accuracy needed. |
-| `browser_type` | Type into the focused element. For keystroke-sensitive widgets; prefer `browser_fill` otherwise. |
+| `browser_type` | Enter text into a field by `ref`/selector (replaces its value; `clear:false` appends) or into the focused element. Real input events, so autocomplete opens; returns the value read back. |
 | `browser_press_key` | Press a key with an optional modifier bitfield. |
 | `browser_dispatch_key` | Synthetic DOM `KeyboardEvent` on one element, for pages that ignore raw CDP keys. |
 | `browser_scroll` | Scroll by delta. W3C wheel convention: positive `deltaY` = down. |
@@ -184,7 +185,9 @@ tabs or navigating the tab to another origin.
 | Tool | Purpose |
 |---|---|
 | `browser_run_script` | Run a temporary script with raw CDP and full Node access. See [Extending](#extending). |
-| `browser_setup` | Explicit agent-callable setup to initialize or recover from an initialization failure latch. |
+| `browser_save_recipe` | Save the browser task the agent just finished as a replayable recipe. See [Saved recipes](#saved-recipes). |
+| `browser_run_recipe` | Replay a saved recipe with no model calls, or list recipes when called with no name. |
+| `browser_setup` | Agent-callable setup, idempotent — how the agent recovers from `not initialized` or a latched initialization failure. |
 
 `browser_snapshot`, `browser_network_requests`, `browser_console`, `browser_execute_js`,
 `browser_web_search`, and `browser_read_page` ship custom TUI rendering: compact by default,
@@ -202,7 +205,7 @@ Wait, snapshot once, then act by ref. No screenshots anywhere in this loop.
 ```
 browser_wait_for({ selector: "#email" })
 browser_snapshot()                                  // → [e7] textbox, [e9] combobox, [e12] button
-browser_fill({ ref: "e7", value: "a@b.com" })
+browser_type({ ref: "e7", text: "a@b.com" })
 browser_select_option({ ref: "e9", label: "India" })
 browser_click({ ref: "e12" })                       // re-resolves position even after reflow
 ```
@@ -244,7 +247,13 @@ browser_network_requests({                          // did a request 4xx/5xx?
 ```
 browser_web_search({ query: "chrome devtools protocol overview", limit: 5 })
 browser_read_page({ url: "<the best result's url>" })
+
+// Search one engine only, with no fallback:
+browser_web_search({ query: "chrome devtools protocol overview", engine: "bing" })
 ```
+
+`details.engine` names the engine that answered, and `details.fallbacks` lists any engines that failed
+first (CAPTCHA, no results, markup change, load failure).
 
 Both tools open their own isolated tab, so neither disturbs the tab you are working in.
 
@@ -256,6 +265,49 @@ Modifiers are a bitfield: `1` Alt · `2` Ctrl · `4` Meta/Cmd · `8` Shift.
 browser_press_key({ key: "c", modifiers: 2 })    // Ctrl+C
 browser_press_key({ key: "T", modifiers: 10 })   // Ctrl+Shift+T
 ```
+
+---
+
+## Saved recipes
+
+Every page-changing browser call is journaled to `~/.pi/agent/browser-harness/journal/<session>.jsonl`
+(user-only permissions, pruned after 30 days). Password values are never written.
+
+After a multi-step task the agent offers to save it. `browser_save_recipe` turns that task into a YAML
+file under `~/.pi/agent/browser-recipes/<site>/<name>.yaml` (or `.pi/browser-recipes/` in the project
+with `project: true`), replacing the values you name as params with `{{param}}`. You confirm the recipe
+before it is written. Saving over a name bumps `version` and keeps the old file under `.history/`.
+
+Run one yourself with `/browser-recipe vendor-invoices-export month=2026-10` (no model involved), or ask
+the agent ("run the invoices recipe for October"), which calls `browser_run_recipe`. `/browser-recipe`
+with no name lists recipes; names tab-complete. Each step finds its element by role and name, waits up to
+5s for it, and checks that the page changed the way the recorded run did. A status or alert message the
+recorded run saw counts when its first words match, so "Exported 43 rows" satisfies "Exported 42 rows".
+
+When a step fails, the replay stops and hands the agent the step, what it expected and a fresh snapshot.
+The agent finishes your task from that step first, then calls `browser_save_recipe` with `repair_step`,
+which replaces that step onward with what it just did, bumps `version` and keeps the old file. A failed
+`/browser-recipe` goes to the agent the same way. If the page asks you to sign in, the replay stops and the
+agent asks you to sign in; it never types credentials.
+
+A recipe in the project's `.pi/browser-recipes/` comes from whoever wrote the repo, so it needs your
+approval before its first run: you see its file, site, the URLs it opens, the files it uploads and its
+downloads. The approval holds for those exact file bytes (kept in
+`~/.pi/agent/browser-harness/trusted-recipes.json`); if the file changes, you are asked again. Without a UI
+an unapproved project recipe does not run.
+
+Reads are kept too: a `browser_http_get`, or a `browser_read_page` of a URL, becomes a read step, and a
+replay returns what each one fetched (`browser_run_recipe` in its result, `/browser-recipe` as a message in
+the session that starts no model turn). A read made with request headers or a tab id is left out, since
+headers can carry credentials and a tab id means nothing next run. A `browser_execute_js` that changed
+nothing is left out as well, so a replay does not return what it read; read data with `browser_http_get`
+or `browser_read_page` when the recipe should hand it back.
+
+If the site shows Cloudflare's "Just a moment..." check, a replay waits up to 30s for it to clear; if it
+does not, the replay stops and the agent asks you to complete the check in the browser.
+
+A task that typed into a password field, or used a `browser_execute_js` that changed the page or
+`browser_run_script`, cannot be saved.
 
 ---
 
@@ -309,7 +361,7 @@ re-runnable.
 
 Another extension can add its own `browser_*` tools to this harness. Contributed tools share the
 same client, mutation mutex, tab ownership, and lane prompt as the built-ins, so a `serialized` tool
-you add queues behind `browser_click` exactly as `browser_fill` does.
+you add queues behind `browser_click` exactly as `browser_type` does.
 
 Define the tool with `defineBrowserTool` and hand it to `registerBrowserTools` at your extension's
 load time, before pi emits `session_start`. The harness registers it with pi on the next
@@ -400,12 +452,13 @@ listed with each.
 | `/browser-profile` | Pick which browser profile the agent works in. Remembered across sessions. |
 | `/browser-status` | Connection state, selected profile, and current page. |
 | `/browser-reload-daemon` | Force a client restart. Rarely needed — the transport reconnects on its own. |
+| `/browser-recipe` | Replay a saved recipe: `/browser-recipe NAME key=value`. No name lists recipes. |
 
 | Flag / variable | Effect |
 |---|---|
 | `--browser-namespace <name>` | Override the session namespace (default: auto-generated). |
 | `--browser-debug-clicks` | Save annotated click screenshots for debugging. Equivalent to `BH_DEBUG_CLICKS=1`. |
-| `BU_CDP_WS` | Attach to a remote browser by WebSocket URL instead of discovering a local one. The daemon reads this when it starts, so stop a running daemon first. |
+| `BU_CDP_WS` | Attach to a browser by WebSocket URL instead of discovering one. The daemon reads this when it starts, so stop a running daemon first. |
 | `BH_DEBUG_CLICKS` | Same as `--browser-debug-clicks`. |
 | `BU_CDP_PORTS` | Extra ports to probe during CDP discovery, beyond 9222. |
 | `BH_SCRIPT_DIR` | Additional directory `browser_run_script` will accept paths from. |
@@ -450,13 +503,46 @@ rather than being copied into the browser prompt.
 
 ---
 
+### When the browser is closed
+
+If no browser is running, `/browser-setup` can open one for you:
+
+- **Interactive session.** Setup asks "Open Chrome?" first. Your windows and tabs come back as you left them.
+- **No UI (print mode, CI).** Setup opens the browser without asking only when a profile is pinned
+  (`/browser-profile`), because the pin already says which browser and profile to use.
+
+Setup never opens a browser when `BU_CDP_WS` is set, when a Linux session has no display, or when
+several browsers are installed and no profile is pinned (it will not guess). Opening the browser does
+not turn remote debugging on: if you have never enabled it, setup opens the browser and then shows
+the usual `chrome://inspect/#remote-debugging` instructions.
+
+### Browser on another machine
+
+The browser does not have to run on the machine pi runs on. `/browser-setup` connects to any DevTools
+endpoint it can reach, which covers pi in WSL2 driving a browser on the Windows host, a browser behind
+an SSH tunnel, and a browser in a container.
+
+- **Port on loopback.** Make the browser's DevTools port answer on `127.0.0.1:9222` where pi runs.
+  Setup finds it with no configuration; add other ports with `BU_CDP_PORTS`.
+  - SSH: forward the port with `-L 9222:127.0.0.1:9222`.
+  - WSL2: the Windows host's localhost is reachable from WSL only with mirrored networking
+    (`networkingMode=mirrored` in `.wslconfig`). With the default NAT networking, forward the port
+    yourself or use `BU_CDP_WS`. Check with `curl http://127.0.0.1:9222/json/version` from WSL.
+- **Explicit endpoint.** Set `BU_CDP_WS` to the browser's WebSocket URL (the `webSocketDebuggerUrl`
+  from `http://<host>:<port>/json/version`).
+
+`BU_CDP_WS` and `BU_CDP_PORTS` are the only endpoint variables read. Profile selection
+(`/browser-profile`) is unavailable for a browser on another machine, because its profiles are on
+that machine's disk; the agent works in whichever window is focused.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | `DevToolsActivePort not found` | Open `chrome://inspect/#remote-debugging`, tick **Discover network targets**, click **Allow**. Or relaunch with `--remote-debugging-port=9222`. |
-| `No browser instance running` | Chrome/Brave/Edge isn't open, or only helper processes remain. Open the browser, then `/browser-setup`. |
-| `Browser harness not initialized` | Run `/browser-setup` — or let the agent explicitly call `browser_setup`. After a failed initialization, subsequent ordinary tools return that cause without retrying until explicit setup runs. |
+| `No browser found` | No browser process on this machine and nothing answering on the DevTools port. Open Chrome/Brave/Edge, then `/browser-setup`. For a browser on another machine, see [Browser on another machine](#browser-on-another-machine). Setup offers to open a closed browser itself; see [When the browser is closed](#when-the-browser-is-closed) for when it does not. |
+| `Opened <browser>, but it did not start` | Setup launched the browser but nothing came up within 15s (often no display). Open it yourself, then `/browser-setup`. |
+| `Browser harness not initialized` | Run `/browser-setup` — or let the agent call `browser_setup` itself. After a failed initialization, ordinary tools return that cause without retrying until explicit setup runs. |
 | `ref is stale` | The page re-rendered. Re-run `browser_snapshot` for fresh refs. |
 | Page looks loaded but content is missing | SPA still rendering. Use `browser_wait_for({ selector })`, not a fixed sleep. |
 | Click did nothing | Check `browser_console` for a thrown error, then `browser_network_requests` for a failed call. |

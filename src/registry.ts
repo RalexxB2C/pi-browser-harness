@@ -4,7 +4,7 @@ import type { BrowserTool } from "./util/tool";
 import { type Result, err, ok } from "./util/result";
 import { clickTool } from "./domains/click";
 import { typeTool, pressKeyTool, dispatchKeyTool } from "./domains/keyboard";
-import { fillTool, selectOptionTool, focusTool, setCheckedTool } from "./domains/form";
+import { selectOptionTool, focusTool, setCheckedTool } from "./domains/form";
 import { fillFormTool } from "./domains/form-batch";
 import { pageInfoTool, waitTool, waitForLoadTool, waitForTool } from "./domains/page";
 import { scrollTool } from "./domains/scroll";
@@ -24,12 +24,13 @@ import { executeJsTool, runScriptTool } from "./domains/js";
 import { setupTool } from "./domains/setup";
 import { webSearchTool } from "./domains/search/web-search";
 import { readPageTool } from "./domains/readpage/read-page";
+import { saveRecipeTool } from "./recipes/save-tool";
+import { runRecipeTool } from "./recipes/run-tool";
 
 export const ALL_TOOLS: ReadonlyArray<BrowserTool> = [
   setupTool,
   clickTool,
   typeTool,
-  fillTool,
   fillFormTool,
   selectOptionTool,
   setCheckedTool,
@@ -68,6 +69,8 @@ export const ALL_TOOLS: ReadonlyArray<BrowserTool> = [
   runScriptTool,
   webSearchTool,
   readPageTool,
+  saveRecipeTool,
+  runRecipeTool,
 ];
 
 export type RegistryError = {
@@ -88,8 +91,9 @@ export type ToolRegistry = {
   // Append a batch atomically: a name clash anywhere in it (with the registry or within the batch)
   // rejects the whole call and leaves the registry untouched.
   readonly addAll: (tools: ReadonlyArray<BrowserTool>) => Result<void, RegistryError>;
-  // Register every tool that has not been registered with pi yet. Safe to call on every
-  // session_start: tools added after an earlier call land on the next one.
+  // Register every tool that has not been registered with this pi instance yet. Safe to call on
+  // every session_start: tools added after an earlier call land on the next one, and a fresh pi
+  // instance (pi builds one per session but reuses this cached module) gets every tool again.
   readonly register: (pi: ToolRegistrar, client: BrowserClient) => void;
 };
 
@@ -101,7 +105,9 @@ const duplicateName = (name: string): RegistryError => ({
 export const createToolRegistry = (initial: ReadonlyArray<BrowserTool> = ALL_TOOLS): ToolRegistry => {
   const tools: BrowserTool[] = [];
   const names = new Set<string>();
-  const registered = new Set<string>();
+  // Keyed by pi instance: a process-wide set made every session after the first start with no
+  // browser tools, because pi hands each session an empty tool list.
+  const registeredByPi = new WeakMap<ToolRegistrar, Set<string>>();
 
   const addAll = (batch: ReadonlyArray<BrowserTool>): Result<void, RegistryError> => {
     const seen = new Set<string>();
@@ -125,6 +131,8 @@ export const createToolRegistry = (initial: ReadonlyArray<BrowserTool> = ALL_TOO
     add,
     addAll,
     register: (pi, client) => {
+      const registered = registeredByPi.get(pi) ?? new Set<string>();
+      registeredByPi.set(pi, registered);
       for (const tool of tools) {
         if (registered.has(tool.name)) continue;
         tool.register(pi, client);

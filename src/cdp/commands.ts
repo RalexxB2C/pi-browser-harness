@@ -271,6 +271,18 @@ export const COMMANDS = {
     }),
     Type.Object({ data: Type.String(), stream: Type.Optional(Type.String()) }),
   ),
+  "Page.getLayoutMetrics": cmd(
+    Empty,
+    Type.Object(
+      {
+        cssLayoutViewport: Type.Object(
+          { clientWidth: Type.Number(), clientHeight: Type.Number() },
+          { additionalProperties: true },
+        ),
+      },
+      { additionalProperties: true },
+    ),
+  ),
   "Page.handleJavaScriptDialog": cmd(
     Type.Object({ accept: Type.Boolean(), promptText: Type.Optional(Type.String()) }),
     Empty,
@@ -283,6 +295,7 @@ export const COMMANDS = {
         returnByValue: Type.Optional(Type.Boolean()),
         awaitPromise: Type.Optional(Type.Boolean()),
         userGesture: Type.Optional(Type.Boolean()),
+        replMode: Type.Optional(Type.Boolean()),
       },
       { additionalProperties: true },
     ),
@@ -321,9 +334,29 @@ export const COMMANDS = {
       ),
     }),
   ),
+  "DOM.scrollIntoViewIfNeeded": cmd(
+    Type.Object({ nodeId: Type.Optional(Type.Number()), backendNodeId: Type.Optional(Type.Number()) }),
+    Empty,
+  ),
+  "DOM.getNodeForLocation": cmd(
+    Type.Object({
+      x: Type.Integer(),
+      y: Type.Integer(),
+      includeUserAgentShadowDOM: Type.Optional(Type.Boolean()),
+      ignorePointerEventsNone: Type.Optional(Type.Boolean()),
+    }),
+    Type.Object(
+      { backendNodeId: Type.Number(), frameId: Type.Optional(Type.String()), nodeId: Type.Optional(Type.Number()) },
+      { additionalProperties: true },
+    ),
+  ),
   "DOM.resolveNode": cmd(
     Type.Object({ nodeId: Type.Optional(Type.Number()), backendNodeId: Type.Optional(Type.Number()) }),
     Type.Object({ object: RemoteObject }),
+  ),
+  "DOM.describeNode": cmd(
+    Type.Object({ objectId: Type.String() }),
+    Type.Object({ node: Type.Object({ backendNodeId: Type.Number() }, { additionalProperties: true }) }),
   ),
   "DOM.setFileInputFiles": cmd(
     Type.Object({

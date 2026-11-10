@@ -38,8 +38,15 @@ const prettyJson = (text: string): string => {
 };
 
 const ExecuteJsArgs = Type.Object({
-  expression: Type.String({ description: "JavaScript expression. `return X` is auto-wrapped in an IIFE." }),
+  expression: Type.String({ description: "A JavaScript expression, or a function body: a body with a top-level `return` (after any statements) runs inside an async function and returns that value." }),
   targetId: Type.Optional(Type.String({ description: "Optional iframe targetId; default = current page." })),
+  timeoutMs: Type.Optional(
+    Type.Integer({
+      minimum: 1_000,
+      maximum: 120_000,
+      description: "How long to wait for the result (an awaited promise included). Default 30000, max 120000. Raise it for scripts that loop with waits.",
+    }),
+  ),
 });
 
 const ExecuteJsDetailsSchema = Type.Object({
@@ -51,11 +58,13 @@ const ExecuteJsDetailsSchema = Type.Object({
 
 export type ExecuteJsDetails = DetailsOf<typeof ExecuteJsDetailsSchema>;
 
+const EXECUTE_JS_DEFAULT_TIMEOUT_MS = 30_000;
+
 export const executeJsTool = defineBrowserTool({
   name: "browser_execute_js",
   label: "Browser Execute JS",
   description:
-    "Surgical reads from the DOM. The cheapest, most precise way to extract a specific element's text, attribute, value, or geometry. Prefer over browser_screenshot for ANY data extraction or coordinate lookup. `return X` is auto-wrapped in an IIFE. Always use safeJs / JSON.stringify when interpolating untrusted strings.",
+    "Surgical reads from the DOM. The cheapest, most precise way to extract a specific element's text, attribute, value, or geometry. Prefer over browser_screenshot for ANY data extraction or coordinate lookup. A body with a top-level `return` runs inside an async function; `const`/`let` names can be declared again in later calls. Always use safeJs / JSON.stringify when interpolating untrusted strings.",
   promptSnippet: "Execute JS in the page — surgical DOM reads (preferred over screenshot)",
   promptGuidelines: [
     "DEFAULT for extracting a specific value: `document.querySelector('.price').innerText`, `input.value`, `el.getAttribute('aria-label')`, etc.",
@@ -63,13 +72,22 @@ export const executeJsTool = defineBrowserTool({
     "For 'is this element visible / enabled / checked / focused', a one-liner here beats a screenshot every time.",
     "For iframes, first run `Object.values(document.querySelectorAll('iframe'))` to find the iframe, then pass its targetId.",
     "Result must be JSON-serializable (Runtime.evaluate returnByValue=true).",
+    "A script that awaits (loops with setTimeout, waits for UI) gets 30s by default; pass timeoutMs (max 120000) for longer ones.",
   ],
   parameters: ExecuteJsArgs,
   details: ExecuteJsDetailsSchema,
   concurrency: "parallel",
   async handler(args, { client }): Promise<Result<ToolOk<ExecuteJsDetails>, ToolErr>> {
-    const r = await evalJs(client, args.expression, args.targetId);
-    if (!r.success) return r;
+    const timeoutMs = args.timeoutMs ?? EXECUTE_JS_DEFAULT_TIMEOUT_MS;
+    const r = await evalJs(client, args.expression, args.targetId, { timeoutMs });
+    if (!r.success) {
+      if (r.error.kind !== "timeout" && !/timeout/i.test(r.error.message)) return r;
+      return err({
+        kind: "timeout",
+        message: `${r.error.message}. The script may have partly run before the wait ran out — check the page's state before retrying. Pass a larger timeoutMs (max 120000) or split the work into several calls.`,
+        details: { ...(r.error.details ?? {}), timeoutMs },
+      });
+    }
     const valueStr = r.data === undefined ? "undefined" : JSON.stringify(r.data);
     // The full value lives in the text (and in fullOutputPath when truncated); details carry only what the
     // renderer needs so a large result is not persisted twice.

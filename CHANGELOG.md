@@ -18,6 +18,70 @@ All notable changes to pi-browser-harness will be documented in this file.
 - **Latched initialization failures with explicit setup recovery.** The client remembers the root cause of an initialization failure. Subsequent ordinary reads return the stored cause immediately without repeating initialization or launching service windows. Only an explicitly requested setup (`/browser-setup`, `browser_setup`, or daemon reconnect) permits a retry.
 - **Root cause preservation on missing daemon socket.** The tool wrapper surfaces the stored initialization failure cause before checking daemon socket existence, preventing premature generic setup error messages.
 
+## 0.17.0 — 2026-11-09
+
+### Added
+
+- **`/browser-setup` can open a closed browser.** With no browser running, an interactive setup asks "Open Chrome?" and, on yes, starts it and carries on once its DevTools endpoint answers. Without a UI it opens the browser unasked only when a profile is pinned. It never opens one when `BU_CDP_WS` is set, when a Linux session has no display, when several browsers are installed and none is pinned, or when the pin belongs to a beta, dev or canary build.
+
+### Fixed
+
+- **`/browser-setup` connects to a browser that is not on this machine (#54, #41).** Setup refused with "No browser instance running" unless a browser process existed locally, before it ever tried the DevTools endpoint, so pi in WSL2 with the browser on Windows, a browser behind an SSH tunnel, and `BU_CDP_WS` itself all failed. Setup now decides once where the browser is (`src/browser-location.ts`): a reachable endpoint is enough to proceed, and the local process scan only shapes the error and gates local-only features. With no browser anywhere the error is now "No browser found" and names the remote options.
+- **A saved profile pin no longer breaks a remote browser.** A pin is applied by launching this machine's browser, which failed the connection (or could open a different browser) when the connected one was elsewhere. The pin is suspended, not cleared, while the browser is remote, and `/browser-profile` says profiles can't be listed from here instead of offering another browser's.
+- **A browser on a fallback port no longer waits behind a stale port file.** When every `DevToolsActivePort` file on disk belonged to a browser that had closed, discovery polled those dead ports for 30s before trying port 9222. It now tries the fallback ports first in that case.
+
+## 0.16.0 — 2026-11-07
+
+### Added
+
+- **`browser_web_search` falls back across search engines.** With no `engine` given it tries Google, then Bing, DuckDuckGo and Brave, until one returns results, so a Google CAPTCHA or markup change no longer breaks search. `details.engine` says which engine answered and `details.fallbacks` lists the ones that failed first. When every engine fails the error is `all_engines_failed` with each engine's reason; when none found anything it stays `no_results`.
+- **`engine` parameter.** Name one engine (`google`, `bing`, `duckduckgo`, `brave`) to search it alone, with no fallback.
+- **Pluggable engines.** Each engine is a self-contained module mounted into a registry (`createEngineRegistry().mount(engine)`) that is injected into `createWebSearchTool`; mount order is the fallback order. Adding an engine is one module and one `mount`.
+
+## 0.15.1 — 2026-11-07
+
+- Re-release of 0.15.0, whose npm publish failed (the provenance log returned 502, then rejected the retry as a duplicate). No code changes.
+
+## 0.15.0 — 2026-11-07
+
+### Changed
+
+- **`browser_fill` and `browser_type` are one tool: `browser_type`.** Pass a `ref` (or `selector`) and it focuses the field, replaces its value (`clear:false` appends; `text: ""` empties it), types with real input events so autocomplete lists open, and reports the value read back. When typing does not produce the value (date or masked inputs) it sets the value directly and says so. With no ref it types into the focused element, appending as before. Saved recipes with `fill` steps still replay.
+
+### Fixed
+
+- **`browser_click` no longer clicks into nothing.** A ref is scrolled into view (nested scrolling lists included) and measured at click time; a point still outside the viewport, or an `x`/`y` outside it, is refused with the reason. When something covers the element (an overlay, a sticky header) the result says what was clicked instead. An `x`/`y` click names the element it landed on.
+- **`browser_press_key` runs Cmd/Ctrl shortcuts.** Cmd/Ctrl + A, C, X, V, Z, Y now carry Chrome's editing command, so select-all, copy, paste and undo work. Letter keys send the right `code` (`KeyA`) and key code (65).
+- **`browser_execute_js` waits up to 30s by default, and `timeoutMs` (max 120s) raises it.** It used to stop at 10s, mid-way through scripts that loop with waits. A timeout now says the script may have partly run.
+- **`browser_screenshot` says how its pixels map to click coordinates** when the image is not 1:1 with CSS pixels (2× on Retina, or after `maxDim`).
+
+## 0.14.1 — 2026-11-07
+
+### Fixed
+
+- **Browser tools load in every session, not just the first.** pi builds a fresh tool list for each session it starts in a running process (`/new`, resume, fork, and in-process subagents), but the harness remembered which tools it had registered for the whole process and skipped them all. Those sessions had no `browser_*` tools while the prompt still said they were available. The harness now registers its tools with each new session.
+
+## 0.14.0 — 2026-11-01
+
+### Added
+
+- **Browser recipes: journal and save.** Every page-changing browser call is journaled per session, and `browser_save_recipe` saves the agent's last browser task as a YAML recipe with `{{params}}`, after the user confirms it.
+- **Browser recipes: replay.** `browser_run_recipe` and `/browser-recipe NAME key=value` replay a saved recipe with no model calls, finding each element by role and name and checking each step's recorded outcome. Downloads and status/alert toasts are now recorded, so a step can expect them.
+- **Browser recipes: finish and repair.** A failed replay hands the agent the failed step and a snapshot; the agent finishes the task, then `browser_save_recipe` with `repair_step` rewrites the recipe from that step, keeping the previous version. An auth wall stops the replay without typing anything.
+- **Browser recipes: project recipes need approval.** A recipe from the project's `.pi/browser-recipes/` asks for confirmation, listing its URLs, uploads and downloads, before its first run and again whenever its file changes.
+- **Browser recipes: read steps return data.** `browser_http_get` and `browser_read_page` of a URL are kept as recipe steps, and a replay returns what they fetched: in `browser_run_recipe`'s result, and as a session message from `/browser-recipe` that starts no model turn. A read made with request headers or a tab id is left out.
+- **Browser recipes: bot checks.** A replay waits up to 30s while Cloudflare's "Just a moment..." check is showing; if it never clears, the replay stops and the agent asks the user to complete it.
+
+### Fixed
+
+- **`browser_execute_js` with a top-level `return` returns its value.** Any body with a top-level `return` runs inside an async function that is awaited, and scripts run in REPL mode, so a later call may declare the same `const` or `let` again.
+- **`browser_close_tab` is fast and confirms the close.** Closing the current tab no longer waits 10s, and a tab Chrome keeps open (one closed while still loading) is closed again, or reported as still open, instead of being reported closed.
+- **Every element gets a ref.** `browser_snapshot`'s `maxNodes` caps only what is shown, so a ref the agent read from a long page still resolves.
+- **`browser_page_info` reports the new page right after a navigation**, not the cached previous one.
+- **`browser_web_search` resolves Google `/goto` result links**, and treats every Google TLD as Google's own, not a result.
+- **The agent calls `browser_setup` before it has connected** instead of falling back to `curl`: the prompt now says the `browser_*` tools are available and the browser is just not connected yet.
+
+
 ## 0.13.0 — 2026-10-20
 
 ### Fixed
