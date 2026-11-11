@@ -505,6 +505,8 @@ rather than being copied into the browser prompt.
 
 ### When the browser is closed
 
+When Chrome asks **Allow remote debugging**, setup waits up to five minutes for your response on the same connection. A denial or timeout fails setup; run `/browser-setup` explicitly to retry. With a profile pinned, discovery only considers that browser's user-data directory and never falls back to another browser or port. An explicit `BU_CDP_WS` still takes precedence.
+
 If no browser is running, `/browser-setup` can open one for you:
 
 - **Interactive session.** Setup asks "Open Chrome?" first. Your windows and tabs come back as you left them.

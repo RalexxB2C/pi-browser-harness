@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { connect as netConnect } from "node:net";
 import { request as httpRequest } from "node:http";
 import { type Result, err, ok } from "../util/result";
-import { userDataDirCandidates } from "../profile/paths";
+import { pinFilePath, userDataDirCandidates } from "../profile/paths";
 import { type CdpError, cdpError } from "./errors";
 import { asString, errnoCode, isRecord } from "../util/guards";
 import { sleep } from "../util/sleep";
@@ -145,8 +145,8 @@ type PortFileScan = {
 };
 
 // Every DevToolsActivePort file a browser on THIS machine has written. A candidate is only a claim: the file outlives the browser, so its port still has to be probed.
-const readPortFileCandidates = async (): Promise<Result<PortFileScan, CdpError>> => {
-  const dirs = userDataDirCandidates();
+const readPortFileCandidates = async (preferred?: string | null): Promise<Result<PortFileScan, CdpError>> => {
+  const dirs = [...new Set([...(preferred ? [preferred] : []), ...userDataDirCandidates()])];
   const candidates: PortFileCandidate[] = [];
   const readErrors: string[] = [];
   for (const base of dirs) {
@@ -210,7 +210,21 @@ const pathMatchesPortFile = (liveUrl: string, portFilePath: string): boolean => 
   }
 };
 
+// Keep discovery daemon-safe: profile/store depends on host-provided typebox.
+const readPreferredUserDataDir = async (): Promise<string | null> => {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(pinFilePath(), "utf8"));
+    if (!isRecord(parsed) || parsed["version"] !== 1 || !isRecord(parsed["profile"])) return null;
+    const profile = parsed["profile"];
+    const dir = asString(profile["userDataDir"]);
+    return dir && asString(profile["profileDir"]) ? dir : null;
+  } catch {
+    return null;
+  }
+};
+
 export type ProbeDeps = {
+  readonly preferredUserDataDir?: string | null;
   readonly env?: NodeJS.ProcessEnv;
   readonly portFileCandidates?: () => Promise<ReadonlyArray<PortFileCandidate>>;
   readonly isPortLive?: (port: number) => Promise<boolean>;
@@ -227,16 +241,21 @@ export const discoverEndpoint = async (deps: DiscoverDeps = {}): Promise<Result<
   const live = deps.isPortLive ?? isPortLive;
   const wsUrlOf = deps.liveWsUrl ?? queryLiveWsUrl;
   const fallbacks = deps.fallbackPorts ?? fallbackPorts;
+  const preferred = deps.preferredUserDataDir === undefined ? await readPreferredUserDataDir() : deps.preferredUserDataDir;
 
   let scan: PortFileScan;
   if (deps.portFileCandidates) {
     scan = { dirs: [], candidates: await deps.portFileCandidates(), readErrors: [] };
   } else {
-    const read = await readPortFileCandidates();
+    const read = await readPortFileCandidates(preferred);
     if (!read.success) return read;
     scan = read.data;
   }
-  const { dirs, candidates, readErrors } = scan;
+  const { dirs, readErrors } = scan;
+  const candidates = preferred ? scan.candidates.filter((c) => c.userDataDir === preferred) : scan.candidates;
+  if (preferred && candidates.length === 0) {
+    return err(cdpError("discovery_failed", `No DevToolsActivePort for pinned browser ${preferred}. Enable remote debugging there, then retry; no other browser was selected.`));
+  }
 
   if (candidates.length === 0) {
     for (const port of fallbacks()) {
@@ -266,7 +285,7 @@ export const discoverEndpoint = async (deps: DiscoverDeps = {}): Promise<Result<
 
   // Some browsers disable the /json/version endpoint when remote debugging is toggled via chrome://inspect rather than a launch flag, hence the DevToolsActivePort fallback.
   // Every port file is stale (its browser has closed). A browser answering on a fallback port right now, such as a tunnelled one, should not wait out the stale files' deadline.
-  if (liveCandidates.length === 0) {
+  if (!preferred && liveCandidates.length === 0) {
     for (const port of fallbacks()) {
       if (byPort.has(port) || !(await live(port))) continue;
       const liveUrl = await wsUrlOf(port);
@@ -278,9 +297,15 @@ export const discoverEndpoint = async (deps: DiscoverDeps = {}): Promise<Result<
   if (ready.success) {
     const c = ready.data;
     const liveUrl = await wsUrlOf(c.port);
-    if (liveUrl && !pathMatchesPortFile(liveUrl, c.path)) return ok({ wsUrl: liveUrl });
+    if (liveUrl && !pathMatchesPortFile(liveUrl, c.path)) {
+      return preferred
+        ? err(cdpError("discovery_failed", "Pinned browser port now belongs to another browser; refusing to switch."))
+        : ok({ wsUrl: liveUrl });
+    }
     return ok({ wsUrl: liveUrl ?? `ws://127.0.0.1:${c.port}${c.path}`, userDataDir: c.userDataDir });
   }
+
+  if (preferred) return err(ready.error);
 
   for (const port of fallbacks()) {
     if (byPort.has(port) || !(await live(port))) continue;
@@ -299,17 +324,24 @@ export const probeEndpoint = async (deps: ProbeDeps = {}): Promise<CdpEndpoint |
 
   const live = deps.isPortLive ?? isPortLive;
   const wsUrlOf = deps.liveWsUrl ?? queryLiveWsUrl;
-  const candidates = deps.portFileCandidates
+  const preferred = deps.preferredUserDataDir === undefined ? await readPreferredUserDataDir() : deps.preferredUserDataDir;
+  const allCandidates = deps.portFileCandidates
     ? await deps.portFileCandidates()
-    : await readPortFileCandidates().then((scan) => (scan.success ? scan.data.candidates : []));
+    : await readPortFileCandidates(preferred).then((scan) => (scan.success ? scan.data.candidates : []));
+  const candidates = preferred ? allCandidates.filter((c) => c.userDataDir === preferred) : allCandidates;
 
   const liveChecks = await Promise.all(candidates.map((c) => live(c.port)));
   const liveCandidates = candidates.filter((_, i) => liveChecks[i]).sort((x, y) => y.mtimeMs - x.mtimeMs);
   const fromFile = liveCandidates[0];
   if (fromFile) {
     const liveUrl = await wsUrlOf(fromFile.port);
+    if (liveUrl && !pathMatchesPortFile(liveUrl, fromFile.path)) {
+      return preferred ? undefined : { wsUrl: liveUrl };
+    }
     return { wsUrl: liveUrl ?? `ws://127.0.0.1:${fromFile.port}${fromFile.path}`, userDataDir: fromFile.userDataDir };
   }
+
+  if (preferred) return undefined;
 
   // A bare open port proves nothing: only one that answers /json/version is a browser.
   for (const port of (deps.fallbackPorts ?? fallbackPorts)()) {

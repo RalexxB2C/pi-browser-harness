@@ -465,8 +465,9 @@ describe("BrowserClient profile pin against a remote browser", () => {
       "Target.activateTarget": ok({}),
       "Runtime.evaluate": ok({ result: { type: "string", value: PAGE_JSON } }),
     }, {
-      wsUrl: "ws://127.0.0.1:9222/devtools/browser/abc",
+      wsUrl: opts.wsUrl ?? "ws://127.0.0.1:9222/devtools/browser/abc",
       browserId: "abc",
+      ...(opts.userDataDir === undefined ? {} : { userDataDir: opts.userDataDir }),
     });
     const client = createBrowserClient({
       namespace: "test",

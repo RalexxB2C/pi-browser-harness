@@ -6,8 +6,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { createIpcServer, type IpcServer } from "../../src/daemon/server";
-import { deserialize, serialize, type WireControl, type WireMessage } from "../../src/daemon/protocol";
+import { createIpcServer, type IpcServer, type IpcServerOptions } from "../../src/daemon/server";
+import { CDP_ATTEMPT_LIFETIME_MS, deserialize, serialize, type WireControl, type WireMessage } from "../../src/daemon/protocol";
 import { waitFor } from "../helpers/wait";
 
 const SKIP = process.platform === "win32" ? "the fixture server listens on a temp socket file" : false;
@@ -18,10 +18,10 @@ type Harness = {
   readonly dispose: () => Promise<void>;
 };
 
-const startServer = async (maxClients?: number): Promise<Harness> => {
+const startServer = async (maxClients?: number, options: IpcServerOptions = {}): Promise<Harness> => {
   const dir = mkdtempSync(join(tmpdir(), "pbh-server-"));
   const socketPath = join(dir, "d.sock");
-  const server = createIpcServer({ socketPath, ...(maxClients !== undefined ? { maxClients } : {}) });
+  const server = createIpcServer({ ...options, socketPath, ...(maxClients !== undefined ? { maxClients } : {}) });
   await server.start();
   return {
     server,
@@ -69,6 +69,48 @@ const register = async (socketPath: string, clientId: string): Promise<Client> =
 };
 
 describe("daemon ipc server", { skip: SKIP }, () => {
+  test("registration waits for the full Allow lifetime before acknowledging provenance", async () => {
+    let release: (ready: boolean) => void = () => undefined;
+    let requestedWait = 0;
+    let ready = false;
+    const h = await startServer(undefined, {
+      awaitReady: (timeoutMs) => {
+        requestedWait = timeoutMs;
+        return new Promise<boolean>((resolve) => { release = resolve; });
+      },
+      provenance: () => ready ? { browserId: "expected" } : undefined,
+    });
+    try {
+      const client = await dial(h.socketPath);
+      send(client, { type: "control", action: "register", clientId: "allow" });
+      assert.ok(await waitFor(() => requestedWait > 0));
+      assert.equal(requestedWait, CDP_ATTEMPT_LIFETIME_MS);
+      assert.deepEqual(client.received, []);
+      ready = true;
+      release(true);
+      assert.ok(await waitFor(() => client.received.length === 1));
+      assert.deepEqual(client.received[0], { type: "control", action: "registered", clientId: "allow", browserId: "expected" });
+      client.socket.destroy();
+    } finally {
+      release(false);
+      await h.dispose();
+    }
+  });
+
+  test("denied or expired Allow refuses registration without acknowledging a false connection", async () => {
+    const h = await startServer(undefined, { awaitReady: () => Promise.resolve(false) });
+    try {
+      const client = await dial(h.socketPath);
+      send(client, { type: "control", action: "register", clientId: "denied" });
+      assert.ok(await waitFor(client.closed));
+      const message = client.received[0];
+      assert.ok(message?.type === "control" && message.action === "shutdown");
+      assert.match(message.reason ?? "", /Allow remote debugging/);
+      assert.equal(h.server.clientCount(), 0);
+    } finally {
+      await h.dispose();
+    }
+  });
   test("an old readiness completion cannot remove a replacement client's reservation", async () => {
     const dir = mkdtempSync(join(tmpdir(), "pbh-reservation-"));
     const socketPath = join(dir, "d.sock");

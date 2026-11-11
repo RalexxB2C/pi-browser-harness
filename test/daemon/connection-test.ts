@@ -59,6 +59,20 @@ const harness = (opts: {
 };
 
 describe("chrome connection: one dial, one prompt", () => {
+  test("setup waits past the ordinary caller timeout for Allow on the same dial", async () => {
+    const h = harness({ connectTimeoutMs: 10, attemptLifetimeMs: 500 });
+    try {
+      const setup = h.connection.connect(400);
+      await sleep(40);
+      assert.equal(h.connection.status().state, "connecting");
+      assert.equal(h.sockets.length, 1);
+      h.sockets[0]?.open();
+      assert.equal(await setup, true);
+      assert.equal(h.discoverCalls(), 1);
+    } finally {
+      h.connection.stop();
+    }
+  });
   test("a dial outlives the caller wait and later callers join it instead of dialing again", async () => {
     const h = harness({ connectTimeoutMs: 20, attemptLifetimeMs: 500 });
     const first = await h.connection.connect();

@@ -1,4 +1,4 @@
-import { DAEMON_RECONNECT_METHOD } from "./daemon/protocol";
+import { CDP_ATTEMPT_LIFETIME_MS, DAEMON_RECONNECT_METHOD } from "./daemon/protocol";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import { parseJson } from "./schemas/parse";
@@ -270,7 +270,8 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
       // No user-data-dir means the endpoint did not come from a port file here. It is remote if it names another host, or if no browser process runs on this machine either.
       pinSuspended = userDataDir === undefined && (!isLoopbackWsUrl(wsUrl) || !(await localBrowserRunning()));
     }
-    const connected = await transport.connect(wsUrl, { timeoutMs: 10_000 });
+    // Registration must outlive the daemon's single Allow prompt, not latch a 10s timeout.
+    const connected = await transport.connect(wsUrl, { timeoutMs: CDP_ATTEMPT_LIFETIME_MS + 1_000 });
     if (!connected.success) {
       latchedInitFailure = connected.error;
       return connected;
@@ -300,6 +301,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     }
 
     userDataDir = transportUserDataDir;
+    pinSuspended = userDataDir === undefined && (!isLoopbackWsUrl(wsUrl) || !(await localBrowserRunning()));
 
     if (registryProvenance !== null) {
       const browserMatches = Boolean(
@@ -629,6 +631,7 @@ export const createBrowserClient = (opts: BrowserClientOptions): BrowserClient =
     sessionId: session.current()?.sessionId ?? null,
     namespace: opts.namespace,
     ...(remote?.browserId !== undefined ? { remoteBrowserId: remote.browserId } : {}),
+    ...(pinSuspended ? { profileSelectionUnavailable: true } : {}),
   });
 
   const detach = async (): Promise<void> => {

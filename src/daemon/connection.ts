@@ -51,7 +51,7 @@ export type ChromeConnection = {
   // Dials Chrome unless already open, stopped or cooling down. Concurrent callers share the
   // attempt in flight. Resolves true when open, or false once the attempt fails or the caller
   // wait passes; in the latter case the dial itself keeps going.
-  readonly connect: () => Promise<boolean>;
+  readonly connect: (waitMs?: number) => Promise<boolean>;
   // Explicit human demand: clears the cooldown and backoff, then connect().
   readonly reconnectNow: () => Promise<boolean>;
   readonly status: () => ConnectionStatus;
@@ -271,11 +271,11 @@ export const createChromeConnection = (
   const isOpen = (): boolean =>
     current !== null && current.opened && current.socket?.readyState === WebSocket.OPEN;
 
-  const connect = (): Promise<boolean> => {
+  const connect = (waitMs = connectTimeoutMs): Promise<boolean> => {
     if (stopped) return Promise.resolve(false);
     if (current) {
       // A dial in flight is shared: joining it is what keeps Chrome's prompt count at one.
-      if (!current.opened) return waitAtMost(current.settledPromise, connectTimeoutMs);
+      if (!current.opened) return waitAtMost(current.settledPromise, waitMs);
       if (isOpen()) return Promise.resolve(true);
       // Invalidate old registrations before a replacement browser can accept their requests.
       current.end("superseded");
@@ -288,7 +288,7 @@ export const createChromeConnection = (
       attempt.failure ??= e instanceof Error ? e.message : String(e);
       attempt.end("failed");
     });
-    return waitAtMost(attempt.settledPromise, connectTimeoutMs);
+    return waitAtMost(attempt.settledPromise, waitMs);
   };
 
   const start = (): Promise<boolean> => {

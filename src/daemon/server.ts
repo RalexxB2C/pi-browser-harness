@@ -9,6 +9,7 @@ import {
   serialize,
   daemonSocketPath,
   DAEMON_MAX_CLIENTS,
+  CDP_ATTEMPT_LIFETIME_MS,
 } from "./protocol";
 
 export type ClientSocket = {
@@ -143,10 +144,17 @@ export const createIpcServer = (options: IpcServerOptions = {}): IpcServer => {
             const finishRegistration = async (): Promise<void> => {
               try {
                 if (options.awaitReady && !options.provenance?.()) {
-                  await options.awaitReady(5_000);
+                  const ready = await options.awaitReady(CDP_ATTEMPT_LIFETIME_MS);
+                  if (!ready) {
+                    if (reserving.get(clientId) === client) reserving.delete(clientId);
+                    socket.end(serialize({ type: "control", action: "shutdown", reason: 'Chrome did not connect: its "Allow remote debugging" prompt was denied, timed out, or the pinned browser is unavailable. Run /browser-setup to retry.' }) + "\n");
+                    return;
+                  }
                 }
               } catch {
-                // Readiness timeout or failure must not crash server
+                if (reserving.get(clientId) === client) reserving.delete(clientId);
+                socket.end(serialize({ type: "control", action: "shutdown", reason: "Chrome readiness failed. Run /browser-setup to retry." }) + "\n");
+                return;
               }
               if (socket.destroyed || reserving.get(clientId) !== client) {
                 if (reserving.get(clientId) === client) reserving.delete(clientId);

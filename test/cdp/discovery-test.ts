@@ -1,8 +1,12 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { discoverEndpoint, endpointFromEnv, firstReadyPort, isLoopbackWsUrl, parseVersionResponse, probeEndpoint, type PortProbe, type ProbeDeps } from "../../src/cdp/discovery";
+import { discoverEndpoint as discover, endpointFromEnv, firstReadyPort, isLoopbackWsUrl, parseVersionResponse, probeEndpoint as probe, type DiscoverDeps, type PortProbe, type ProbeDeps } from "../../src/cdp/discovery";
 import { err, ok } from "../../src/util/result";
 import { cdpError } from "../../src/cdp/errors";
+
+// Never read the operator's saved pin in injected discovery tests.
+const discoverEndpoint = (deps: DiscoverDeps) => discover({ preferredUserDataDir: null, ...deps });
+const probeEndpoint = (deps: ProbeDeps) => probe({ preferredUserDataDir: null, ...deps });
 
 describe("BU_CDP_WS endpoint override", () => {
   test("an unset variable leaves discovery to run normally", () => {
@@ -125,7 +129,7 @@ describe("probeEndpoint", () => {
       isPortLive: () => Promise.resolve(true),
       liveWsUrl: () => Promise.resolve("ws://127.0.0.1:5002/devtools/browser/current"),
     }));
-    assert.deepEqual(r, { wsUrl: "ws://127.0.0.1:5002/devtools/browser/current", userDataDir: "/udd" });
+    assert.deepEqual(r, { wsUrl: "ws://127.0.0.1:5002/devtools/browser/current" });
   });
 
   test("with no live port file, an answering fallback port is an endpoint with no user-data-dir", async () => {
@@ -185,6 +189,52 @@ describe("isLoopbackWsUrl", () => {
     for (const url of ["ws://example.test/x", "ws://192.168.1.5:9222/x", "ws://127.evil.test/x", "not a url", ""]) {
       assert.equal(isLoopbackWsUrl(url), false, url);
     }
+  });
+});
+
+describe("pinned browser discovery", () => {
+  const candidates = [
+    { port: 5001, path: "/devtools/browser/pinned", mtimeMs: 1, userDataDir: "/pinned" },
+    { port: 5002, path: "/devtools/browser/other", mtimeMs: 2, userDataDir: "/other" },
+  ];
+  const deps = {
+    env: {},
+    preferredUserDataDir: "/pinned",
+    portFileCandidates: () => Promise.resolve(candidates),
+    isPortLive: () => Promise.resolve(true),
+    liveWsUrl: () => Promise.resolve(null),
+    fallbackPorts: () => [9222],
+  };
+
+  test("waits for the pinned browser rather than taking another live browser", async () => {
+    const probed: number[] = [];
+    const result = await discoverEndpoint({ ...deps, probe: (port) => {
+      probed.push(port);
+      return Promise.resolve(ok(undefined));
+    } });
+    assert.ok(result.success);
+    assert.equal(result.data.userDataDir, "/pinned");
+    assert.deepEqual(probed, [5001]);
+  });
+
+  test("a pinned timeout never falls back to another browser", async () => {
+    const result = await discoverEndpoint({ ...deps, deadlineMs: 30, intervalMs: 5,
+      probe: () => Promise.resolve(err(cdpError("discovery_failed", "not ready"))),
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("a reused pinned port fails closed instead of returning the foreign browser", async () => {
+    const result = await discoverEndpoint({ ...deps,
+      liveWsUrl: () => Promise.resolve("ws://127.0.0.1:5001/devtools/browser/foreign"),
+      probe: () => Promise.resolve(ok(undefined)),
+    });
+    assert.equal(result.success, false);
+  });
+
+  test("the setup probe cannot mistake another browser for the pinned one", async () => {
+    const result = await probeEndpoint({ ...deps, isPortLive: (port) => Promise.resolve(port !== 5001) });
+    assert.equal(result, undefined);
   });
 });
 
