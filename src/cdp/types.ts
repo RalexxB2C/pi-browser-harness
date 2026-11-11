@@ -60,6 +60,7 @@ export type DaemonStatus = {
   readonly sessionId: string | null;
   readonly namespace: string;
   readonly remoteBrowserId?: string;
+  readonly profileSelectionUnavailable?: boolean;
 };
 
 export const isCdpRawMessage = (v: unknown): v is CdpRawMessage => {

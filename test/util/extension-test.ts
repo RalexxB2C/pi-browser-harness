@@ -248,6 +248,23 @@ const wire = async (opts: { readonly pin?: ProfilePin | null } = {}): Promise<Wi
 };
 
 describe("createExtension wiring", () => {
+  test("remote browser status explains unavailable profile selection without suggesting the local picker", async () => {
+    const fake = await createFakeClient();
+    const pi = fakePi();
+    createExtension({
+      createTransport: () => createStubTransport().transport,
+      createClient: () => ({ ...fake.client,
+        status: () => ({ ...fake.client.status(), profileSelectionUnavailable: true }),
+      }),
+      readPin: () => Promise.resolve(null),
+    })(pi.pi);
+    await pi.emit("session_start", { type: "session_start" }, fakeCtx().ctx);
+    const ctx = fakeCtx();
+    await pi.command("browser-status").handler("", ctx.ctx);
+    const message = ctx.notices[0]?.message ?? "";
+    assert.match(message, /remote browser.*local profile selection unavailable/);
+    assert.ok(!message.includes("/browser-profile"));
+  });
   test("the --browser-namespace flag value is the namespace handed to the transport and the client", async () => {
     const w = await wire();
     w.pi.setFlag("browser-namespace", "team-alpha");

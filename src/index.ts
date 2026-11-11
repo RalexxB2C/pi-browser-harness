@@ -101,7 +101,7 @@ export const createExtension = (deps: ExtensionDeps = {}): ((pi: ExtensionAPI) =
       const pin = client.profilePin();
       const lines = [
         `Browser: ${s.alive ? "🟢 Connected" : "🔴 Disconnected"}`,
-        `Profile: ${pin ? pin.label : "not selected (uses whichever window is focused) — run /browser-profile"}`,
+        `Profile: ${s.profileSelectionUnavailable ? "remote browser — local profile selection unavailable; saved selection is suspended" : pin ? pin.label : "not selected (uses whichever window is focused) — run /browser-profile"}`,
         `Session: ${s.sessionId ?? "none"}`,
       ];
       if (s.remoteBrowserId) lines.push(`Browser ID: ${s.remoteBrowserId}`);
