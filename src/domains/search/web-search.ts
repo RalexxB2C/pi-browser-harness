@@ -270,7 +270,7 @@ export const createWebSearchTool = (deps: WebSearchDeps) => {
       `Search the web and return ranked results (title, url, snippet, rank). Scrapes a search engine results page in the real Chrome — no API key. Engines: ${ids.join(", ")}. With no engine given it walks the fallback ladder ${ladderText} until one returns results. Returns links only; use browser_read_page to read a result's content.`,
     promptSnippet: "Search the web for a query",
     promptGuidelines: [
-      `Omit engine to get the fallback ladder (${ladderText}); details.engine says which engine answered and details.fallbacks lists the engines that failed first.`,
+      "details.engine says which engine answered and details.fallbacks lists the engines that failed first.",
       "Pass engine only when one engine is specifically needed; a named engine is tried alone, with no fallback.",
       "On a CAPTCHA / bot wall the call fails with kind:'invalid_state' and details.reason:'captcha' (plus serpUrl and engine) — surface it to the user; do not retry in a tight loop.",
       "On zero results it fails with details.reason:'no_results' — rephrase the query and try again.",
